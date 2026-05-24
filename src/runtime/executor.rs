@@ -86,10 +86,7 @@ impl TaskExecutor {
             }
             Err(e) => {
                 error!("Task {} execution failed: {}", task_id, e);
-                NodeTaskResult::Failed {
-                    code: "ollama_error".to_string(),
-                    message: e.to_string(),
-                }
+                classify_ollama_error(&e)
             }
         };
 
@@ -304,6 +301,32 @@ impl TaskExecutor {
                 task_id
             );
         }
+    }
+}
+
+/// 把 Ollama 调用错误分类成 NodeTaskResult, 携带 is_client_error 标志:
+/// - Ollama 4xx (如 "model does not support chat") → is_client_error=true
+///   服务端会立即 terminal failed, 不计入 node failure_count
+/// - Ollama 5xx / 网络错 → is_client_error=false (默认行为, requeue + 失败计数)
+fn classify_ollama_error(err: &NodeTokenError) -> NodeTaskResult {
+    let (code, message, is_client_error) = match err {
+        NodeTokenError::HttpError { status, message } if (400..500).contains(status) => (
+            format!("ollama_http_{}", status),
+            message.clone(),
+            true,
+        ),
+        NodeTokenError::HttpError { status, message } => (
+            format!("ollama_http_{}", status),
+            message.clone(),
+            false,
+        ),
+        NodeTokenError::Network(e) => ("ollama_network".to_string(), e.to_string(), false),
+        other => ("ollama_error".to_string(), other.to_string(), false),
+    };
+    NodeTaskResult::Failed {
+        code,
+        message,
+        is_client_error,
     }
 }
 
@@ -604,15 +627,56 @@ mod tests {
         let result = NodeTaskResult::Failed {
             code: "ollama_error".to_string(),
             message: error_msg.to_string(),
+            is_client_error: false,
         };
 
         // 验证结果结构
         match result {
-            NodeTaskResult::Failed { code, message } => {
+            NodeTaskResult::Failed {
+                code,
+                message,
+                is_client_error,
+            } => {
                 assert_eq!(code, "ollama_error");
                 assert_eq!(message, error_msg);
+                assert!(!is_client_error);
             }
             NodeTaskResult::Succeeded { .. } => panic!("Expected Failed variant"),
+        }
+    }
+
+    /// B1 修复回归: HTTP 4xx 应被分类为 is_client_error=true
+    #[test]
+    fn test_classify_ollama_4xx_is_client_error() {
+        let err = NodeTokenError::HttpError {
+            status: 400,
+            message: "model does not support chat".to_string(),
+        };
+        match classify_ollama_error(&err) {
+            NodeTaskResult::Failed {
+                is_client_error,
+                code,
+                ..
+            } => {
+                assert!(is_client_error, "4xx must mark is_client_error=true");
+                assert_eq!(code, "ollama_http_400");
+            }
+            _ => panic!("expected Failed"),
+        }
+    }
+
+    /// HTTP 5xx 应是节点错, is_client_error=false (保持现有 retry 行为)
+    #[test]
+    fn test_classify_ollama_5xx_is_not_client_error() {
+        let err = NodeTokenError::HttpError {
+            status: 503,
+            message: "service unavailable".to_string(),
+        };
+        match classify_ollama_error(&err) {
+            NodeTaskResult::Failed {
+                is_client_error, ..
+            } => assert!(!is_client_error),
+            _ => panic!("expected Failed"),
         }
     }
 

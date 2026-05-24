@@ -202,6 +202,10 @@ pub enum NodeTaskResult {
         code: String,
         /// 错误消息
         message: String,
+        /// 该失败是否由请求本身的问题引起(如模型不支持、参数非法)。
+        /// 老 server 忽略该字段时仍按通常失败处理, 保留向后兼容。
+        #[serde(default)]
+        is_client_error: bool,
     },
 }
 
@@ -709,6 +713,7 @@ mod tests {
             result: NodeTaskResult::Failed {
                 code: "ollama_error".to_string(),
                 message: "Model not found".to_string(),
+                is_client_error: false,
             },
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -718,9 +723,14 @@ mod tests {
         assert_eq!(parsed.protocol_version, "node.v1");
         assert_eq!(parsed.task_id, task_id);
         match parsed.result {
-            NodeTaskResult::Failed { code, message } => {
+            NodeTaskResult::Failed {
+                code,
+                message,
+                is_client_error,
+            } => {
                 assert_eq!(code, "ollama_error");
                 assert_eq!(message, "Model not found");
+                assert!(!is_client_error);
             }
             NodeTaskResult::Succeeded { .. } => panic!("Expected Failed variant"),
         }
