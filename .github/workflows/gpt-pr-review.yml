@@ -69,12 +69,7 @@ jobs:
               break
             fi
 
-            python -c "
-            import json
-            all_files = json.load(open('pr_files.json'))
-            page_files = json.load(open('pr_files_page_$PAGE.json'))
-            json.dump(all_files + page_files, open('pr_files.json','w'))
-            "
+            python -c "import json; all_files=json.load(open('pr_files.json')); page_files=json.load(open('pr_files_page_$PAGE.json')); json.dump(all_files+page_files, open('pr_files.json','w'))"
             rm -f "pr_files_page_$PAGE.json"
             PAGE=$((PAGE + 1))
           done
@@ -102,16 +97,7 @@ jobs:
             printf '## Title\nBot PR Review\n\n## Overall Assessment\nThe review workflow failed before producing output.\n\n## Blocking Issues\n- Workflow execution error.\n\n## Non-blocking Suggestions\n- Check the workflow logs.\n\n## Suggested Tests\n- Re-run the workflow.\n\n## Conclusion\nThe review could not be completed.\n' > review-output.md
           fi
 
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          body = Path("review-output.md").read_text(encoding="utf-8")
-          Path("review-comment.json").write_text(
-              json.dumps({"body": body}, ensure_ascii=False),
-              encoding="utf-8",
-          )
-          PY
+          python -c "import json; from pathlib import Path; body=Path('review-output.md').read_text(encoding='utf-8'); Path('review-comment.json').write_text(json.dumps({'body':body},ensure_ascii=False),encoding='utf-8')"
 
           curl -fsSL \
             -X POST \
