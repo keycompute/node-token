@@ -109,7 +109,7 @@ async fn test_ollama_connection_failure() {
     // 验证连接失败
     assert!(result.is_err(), "Ollama 连接应该失败");
 
-    // 验证错误信息（可能是 Ollama 错误或 HTTP 错误）
+    // 验证错误信息（HttpError / Ollama / 状态码任一种描述都接受）
     let error_msg = format!("{:?}", result.unwrap_err());
     assert!(
         error_msg.contains("connection")
@@ -117,7 +117,9 @@ async fn test_ollama_connection_failure() {
             || error_msg.contains("Connection")
             || error_msg.contains("Ollama")
             || error_msg.contains("503")
-            || error_msg.contains("HTTP"),
+            || error_msg.contains("502")
+            || error_msg.contains("HTTP")
+            || error_msg.contains("HttpError"),
         "错误信息应该包含 Ollama 或连接失败描述: {}",
         error_msg
     );

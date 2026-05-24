@@ -92,10 +92,11 @@ impl OllamaClient {
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
             error!("Ollama chat failed with status {}: {}", status, body);
-            return Err(NodeTokenError::Ollama(format!(
-                "Chat failed: HTTP {} - {}",
-                status, body
-            )));
+            // 用 HttpError 保留 status code, 让 executor 据此判断 is_client_error (B1 修复支撑)
+            return Err(NodeTokenError::HttpError {
+                status,
+                message: body,
+            });
         }
 
         let chat_response: OllamaChatResponse = response.json().await.map_err(|e| {
