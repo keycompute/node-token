@@ -1,0 +1,122 @@
+name: bot-pr-review
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    if: >
+      github.event.issue.pull_request != null &&
+      contains(github.event.comment.body, '@bot review') &&
+      github.actor != 'github-actions[bot]' &&
+      (github.event.comment.author_association == 'OWNER' || github.event.comment.author_association == 'MEMBER' || github.event.comment.author_association == 'COLLABORATOR')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout base repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install --disable-pip-version-check requests
+
+      - name: Fetch PR metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER" \
+            -o pr.json
+
+      - name: Fetch changed files (paginated)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -eo pipefail
+          echo "[]" > pr_files.json
+          PAGE=1
+          while :; do
+            for attempt in 1 2 3; do
+              curl -fsSL \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER/files?per_page=100&page=$PAGE" \
+                -o "pr_files_page_$PAGE.json" && break
+              sleep 2
+            done
+
+            COUNT=$(python -c "import json; print(len(json.load(open('pr_files_page_$PAGE.json'))))")
+            if [ "$COUNT" -eq 0 ]; then
+              rm -f "pr_files_page_$PAGE.json"
+              break
+            fi
+
+            python -c "
+import json
+all_files = json.load(open('pr_files.json'))
+page_files = json.load(open('pr_files_page_$PAGE.json'))
+json.dump(all_files + page_files, open('pr_files.json','w'))
+"
+            rm -f "pr_files_page_$PAGE.json"
+            PAGE=$((PAGE + 1))
+          done
+
+      - name: Run bot review
+        env:
+          # Read from organization-level secret so only org owners can manage the key
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: https://api.deepseek.com
+          LLM_MODEL: deepseek-v4-flash
+          REPO_NAME: ${{ github.repository }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.actor }}
+        run: python scripts/github/review_pr.py
+
+      - name: Post review comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -eo pipefail
+          if [ ! -f review-output.md ]; then
+            printf '## Title\nBot PR Review\n\n## Overall Assessment\nThe review workflow failed before producing output.\n\n## Blocking Issues\n- Workflow execution error.\n\n## Non-blocking Suggestions\n- Check the workflow logs.\n\n## Suggested Tests\n- Re-run the workflow.\n\n## Conclusion\nThe review could not be completed.\n' > review-output.md
+          fi
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          body = Path("review-output.md").read_text(encoding="utf-8")
+          Path("review-comment.json").write_text(
+              json.dumps({"body": body}, ensure_ascii=False),
+              encoding="utf-8",
+          )
+          PY
+
+          curl -fsSL \
+            -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/$ISSUE_NUMBER/comments" \
+            -d @review-comment.json
