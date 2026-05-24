@@ -71,11 +71,11 @@ jobs:
             fi
 
             python -c "
-import json
-all_files = json.load(open('pr_files.json'))
-page_files = json.load(open('pr_files_page_$PAGE.json'))
-json.dump(all_files + page_files, open('pr_files.json','w'))
-"
+            import json
+            all_files = json.load(open('pr_files.json'))
+            page_files = json.load(open('pr_files_page_$PAGE.json'))
+            json.dump(all_files + page_files, open('pr_files.json','w'))
+            "
             rm -f "pr_files_page_$PAGE.json"
             PAGE=$((PAGE + 1))
           done
