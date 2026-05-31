@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use node_token::protocol::types::{
-    ChatCompletionResponse, CompletionChoice, MessageContent, NodeCapabilities,
+    ChatCompletionResponse, ChoiceMessage, CompletionChoice, NodeCapabilities,
     NodeHeartbeatRequest, NodeModelCapability, NodePollRequest, NodeRegisterRequest, Usage,
 };
 use uuid::Uuid;
@@ -123,7 +123,7 @@ pub fn create_chat_response(
         model,
         choices: vec![CompletionChoice {
             index: 0,
-            message: MessageContent {
+            message: ChoiceMessage {
                 role: "assistant".to_string(),
                 content,
             },

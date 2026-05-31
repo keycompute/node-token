@@ -99,6 +99,7 @@ async fn test_ollama_connection_failure() {
         messages: vec![node_token::protocol::ollama::OllamaMessage {
             role: "user".to_string(),
             content: "Hello".to_string(),
+            images: None,
         }],
         stream: false,
     };

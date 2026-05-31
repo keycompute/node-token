@@ -12,7 +12,6 @@ use tracing::{debug, info};
 
 /// Session 数据（本地持久化）
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)] // 在后续阶段使用
 pub struct SessionData {
     /// 节点 ID
     pub node_id: NodeId,
@@ -27,7 +26,6 @@ pub struct SessionData {
 }
 
 /// 本地存储管理器
-#[allow(dead_code)] // 在后续阶段使用
 pub struct LocalStorage {
     /// 数据目录
     data_dir: PathBuf,
@@ -40,7 +38,6 @@ impl LocalStorage {
     ///
     /// # Arguments
     /// * `data_dir` - 数据目录路径，如果为 None 则使用默认目录
-    #[allow(dead_code)] // 在后续阶段使用
     pub fn new(data_dir: Option<&str>) -> StorageResult<Self> {
         let data_dir = match data_dir {
             Some(dir) => PathBuf::from(dir),
@@ -72,7 +69,6 @@ impl LocalStorage {
     /// Linux: ~/.local/share/node-token
     /// macOS: ~/Library/Application Support/node-token
     /// Windows: %APPDATA%\node-token
-    #[allow(dead_code)] // 在后续阶段使用
     fn default_data_dir() -> StorageResult<PathBuf> {
         let data_dir = dirs::data_dir()
             .ok_or_else(|| {
@@ -88,7 +84,6 @@ impl LocalStorage {
     /// # Security
     /// - 文件权限设置为 600（仅 owner 可读写）
     /// - 日志中不得输出 session_token 明文
-    #[allow(dead_code)] // 在后续阶段使用
     pub fn save_session(&self, session: &SessionData) -> StorageResult<()> {
         debug!(
             "Saving session to file: node_id={}, session_id={}",
@@ -132,7 +127,6 @@ impl LocalStorage {
     /// 加载 session
     ///
     /// 如果文件不存在或解析失败，返回 None
-    #[allow(dead_code)] // 在后续阶段使用
     pub fn load_session(&self) -> StorageResult<Option<SessionData>> {
         if !self.session_file.exists() {
             debug!("Session file does not exist: {:?}", self.session_file);
@@ -158,7 +152,6 @@ impl LocalStorage {
     /// 清除 session
     ///
     /// 删除 session 文件，如果文件不存在则忽略
-    #[allow(dead_code)] // 在后续阶段使用
     pub fn clear_session(&self) -> StorageResult<()> {
         if self.session_file.exists() {
             fs::remove_file(&self.session_file).map_err(|e| {
@@ -172,13 +165,11 @@ impl LocalStorage {
     }
 
     /// 获取数据目录路径
-    #[allow(dead_code)] // 在后续阶段使用
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 
     /// 获取 session 文件路径
-    #[allow(dead_code)] // 在后续阶段使用
     pub fn session_file(&self) -> &Path {
         &self.session_file
     }

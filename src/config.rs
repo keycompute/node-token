@@ -40,7 +40,6 @@ impl Drop for EnvGuard {
 
 /// node-token 配置结构
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)] // 部分字段在后续阶段使用
 pub struct NodeTokenConfig {
     /// KeyCompute 服务端 URL
     pub server_url: String,
@@ -128,7 +127,6 @@ pub fn generate_client_instance_id() -> String {
 
 impl NodeTokenConfig {
     /// 获取数据目录路径
-    #[allow(dead_code)] // 在后续阶段使用
     pub fn data_dir_path(&self) -> PathBuf {
         self.data_dir
             .as_ref()

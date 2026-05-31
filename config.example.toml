@@ -26,3 +26,23 @@ max_concurrent_tasks = 2
 
 # 本地数据目录（可选，默认 ~/.local/share/node-token）
 # data_dir = "/path/to/data"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Docker Compose Ollama 配置（仅 Docker 部署有效，二进制启动不读取）
+# 配置 Ollama 容器的模型保活、端口映射、自动拉取模型等
+# 对应 .env: OLLAMA_KEEP_ALIVE, OLLAMA_PORT, OLLAMA_MODEL, OLLAMA_WARMUP_PROMPT
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 模型在内存中的保活时间（可选，默认 30m）
+# 设置为 -1 表示常驻内存
+# ollama_keep_alive = "30m"
+
+# Ollama API 对外端口映射（可选，默认 11434）
+# ollama_port = 11434
+
+# 容器启动后自动拉取并预热的模型名称（可选，默认 gemma3:270m）
+# ollama_model = "gemma3:270m"
+
+# 预热模型时发送的简短提示词（可选，默认 ready）
+# 预热推理会让模型加载到内存中，减少首次请求的响应延迟
+# ollama_warmup_prompt = "ready"

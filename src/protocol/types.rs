@@ -162,8 +162,32 @@ pub struct NodeTaskEnvelope {
 pub struct NodeTaskPayload {
     /// 请求 ID
     pub request_id: Uuid,
-    /// Chat 完成请求
-    pub chat: ChatCompletionRequest,
+    /// Chat 完成请求（可选，与图片生成/编辑互斥）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat: Option<ChatCompletionRequest>,
+    /// 图片生成请求（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_generation: Option<ImageGenerationRequest>,
+    /// 图片编辑请求（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_edit: Option<ImageEditRequest>,
+}
+
+impl NodeTaskPayload {
+    /// 是否为 Chat 任务
+    pub fn is_chat(&self) -> bool {
+        self.chat.is_some()
+    }
+
+    /// 是否为图片生成任务
+    pub fn is_image_generation(&self) -> bool {
+        self.image_generation.is_some()
+    }
+
+    /// 是否为图片编辑任务
+    pub fn is_image_edit(&self) -> bool {
+        self.image_edit.is_some()
+    }
 }
 
 // ============================================================================
@@ -195,6 +219,11 @@ pub enum NodeTaskResult {
     Succeeded {
         /// Chat 完成响应
         response: ChatCompletionResponse,
+    },
+    /// 图片生成/编辑任务成功
+    ImageSucceeded {
+        /// 图片生成响应
+        image_response: ImageGenerationResponse,
     },
     /// 任务失败
     Failed {
@@ -271,16 +300,181 @@ impl std::fmt::Display for MessageRole {
     }
 }
 
-/// 消息结构
+/// 为 `#[serde(untagged)]` 枚举生成自定义 `Deserialize` 实现
+///
+/// 该枚举有两个变体：纯文本字符串 (`Text(String)`) 和多模态内容块数组 (`Parts(Vec<Part>)`)。
+/// 自定义反序列化在遇到空数组 `[]` 时返回错误，避免多模态数据静默丢弃。
+///
+/// # 参数
+/// - `$enum_ty`: 枚举类型名（如 `MessageContent`）
+/// - `$part_ty`: Part 类型（如 `ContentPart`）
+/// - `$err_desc`: 空数组时的错误描述字符串
+macro_rules! impl_untagged_content_deserialize {
+    ($enum_ty:ty, $part_ty:ty, $err_desc:expr) => {
+        impl<'de> serde::Deserialize<'de> for $enum_ty {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                use serde::de;
+
+                struct ContentVisitor;
+
+                impl<'de> de::Visitor<'de> for ContentVisitor {
+                    type Value = $enum_ty;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        formatter.write_str("a string or a non-empty array of content parts")
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        Ok(<$enum_ty>::Text(value.to_string()))
+                    }
+
+                    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        Ok(<$enum_ty>::Text(value))
+                    }
+
+                    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                    where
+                        A: de::SeqAccess<'de>,
+                    {
+                        let mut parts = Vec::new();
+                        while let Some(part) = seq.next_element::<$part_ty>()? {
+                            parts.push(part);
+                        }
+                        if parts.is_empty() {
+                            return Err(de::Error::invalid_value(de::Unexpected::Seq, &$err_desc));
+                        }
+                        Ok(<$enum_ty>::Parts(parts))
+                    }
+                }
+
+                deserializer.deserialize_any(ContentVisitor)
+            }
+        }
+    };
+}
+
+/// 消息内容：支持纯文本和 Vision 多模态内容
+///
+/// 反序列化时拒绝空数组 `[]`，避免静默丢失数据。
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    /// 纯文本内容
+    Text(String),
+    /// Vision 内容块列表（图片理解等）
+    Parts(Vec<ContentPart>),
+}
+
+// 使用自定义 Deserialize 实现，拒绝空数组 []（防止多模态数据静默丢弃）
+impl_untagged_content_deserialize!(
+    MessageContent,
+    ContentPart,
+    "non-empty array of content parts"
+);
+
+impl MessageContent {
+    /// 从纯文本创建
+    pub fn text(content: impl Into<String>) -> Self {
+        Self::Text(content.into())
+    }
+
+    /// 提取纯文本内容（用于日志/转换等场景）
+    ///
+    /// 对于 `Parts` 变体，此方法用空格拼接所有 `ContentPart::Text` 块，
+    /// 跳过图片块。注意：这是有损转换 — 多段文本的结构信息和图片内容
+    /// 会在此过程中丢失。如需完整的多模态数据，请直接使用 `extract_images()`。
+    pub fn extract_text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::ImageUrl { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+
+    /// 提取所有图片 URL（原始形式，含 data URI 前缀或 HTTP URL）
+    pub fn extract_images(&self) -> Vec<String> {
+        match self {
+            Self::Text(_) => vec![],
+            Self::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::ImageUrl { image_url } => Some(image_url.url.clone()),
+                    ContentPart::Text { .. } => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// 是否为纯文本
+    pub fn is_text(&self) -> bool {
+        matches!(self, Self::Text(_))
+    }
+}
+
+impl From<String> for MessageContent {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
+impl From<&str> for MessageContent {
+    fn from(s: &str) -> Self {
+        Self::Text(s.to_string())
+    }
+}
+
+impl std::fmt::Display for MessageContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.extract_text())
+    }
+}
+
+/// Vision 内容块
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    /// 文本块
+    #[serde(rename = "text")]
+    Text { text: String },
+    /// 图片 URL 块
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrl },
+}
+
+/// 图片 URL 描述
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrl {
+    /// 图片 URL（支持 http/https URL 或 base64 data URI）
+    pub url: String,
+    /// 细节级别：low / high / auto（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: MessageRole,
-    pub content: String,
+    pub content: MessageContent,
 }
 
 impl Message {
     #[allow(dead_code)] // 在后续阶段使用
-    pub fn new(role: MessageRole, content: impl Into<String>) -> Self {
+    pub fn new(role: MessageRole, content: impl Into<MessageContent>) -> Self {
         Self {
             role,
             content: content.into(),
@@ -288,22 +482,22 @@ impl Message {
     }
 
     #[allow(dead_code)] // 在后续阶段使用
-    pub fn system(content: impl Into<String>) -> Self {
+    pub fn system(content: impl Into<MessageContent>) -> Self {
         Self::new(MessageRole::System, content)
     }
 
     #[allow(dead_code)] // 在后续阶段使用
-    pub fn user(content: impl Into<String>) -> Self {
+    pub fn user(content: impl Into<MessageContent>) -> Self {
         Self::new(MessageRole::User, content)
     }
 
     #[allow(dead_code)] // 在后续阶段使用
-    pub fn assistant(content: impl Into<String>) -> Self {
+    pub fn assistant(content: impl Into<MessageContent>) -> Self {
         Self::new(MessageRole::Assistant, content)
     }
 
     #[allow(dead_code)] // 在后续阶段使用
-    pub fn tool(content: impl Into<String>) -> Self {
+    pub fn tool(content: impl Into<MessageContent>) -> Self {
         Self::new(MessageRole::Tool, content)
     }
 }
@@ -357,13 +551,14 @@ pub struct ChatCompletionResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionChoice {
     pub index: u32,
-    pub message: MessageContent,
+    pub message: ChoiceMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
 }
 
+/// 响应消息（用于 chat completion choices）
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MessageContent {
+pub struct ChoiceMessage {
     pub role: String,
     pub content: String,
 }
@@ -373,6 +568,68 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+}
+
+// ============================================================================
+// 图片生成/编辑类型
+// ============================================================================
+
+/// 图片生成请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageGenerationRequest {
+    /// 生成提示词
+    pub prompt: String,
+    /// 生成图片数量（可选，默认 1）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    /// 图片尺寸（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+}
+
+/// 图片编辑请求
+///
+/// 注意：`image` 和 `mask` 字段使用 base64 编码字符串传输，
+/// 而非 `Vec<u8>`（后者经 JSON 序列化后会膨胀约 6 倍体积）。
+/// 执行时由 executor 解码为原始字节。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageEditRequest {
+    /// 编辑提示词
+    pub prompt: String,
+    /// 原始图片（base64 编码，不含 data URI 前缀）
+    pub image: String,
+    /// 遮罩图片（可选，base64 编码）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mask: Option<String>,
+    /// 图片数量（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    /// 图片尺寸（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+}
+
+/// 图片数据
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageData {
+    /// 图片 URL（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Base64 编码的图片数据（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub b64_json: Option<String>,
+    /// 修改后的提示词（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revised_prompt: Option<String>,
+}
+
+/// 图片生成响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageGenerationResponse {
+    /// 创建时间戳
+    pub created: i64,
+    /// 图片数据列表
+    pub data: Vec<ImageData>,
 }
 
 #[cfg(test)]
@@ -664,7 +921,7 @@ mod tests {
                     model: "deepseek-chat".to_string(),
                     choices: vec![CompletionChoice {
                         index: 0,
-                        message: MessageContent {
+                        message: ChoiceMessage {
                             role: "assistant".to_string(),
                             content: "Hello! How can I help you?".to_string(),
                         },
@@ -694,6 +951,7 @@ mod tests {
                     "Hello! How can I help you?"
                 );
             }
+            NodeTaskResult::ImageSucceeded { .. } => panic!("Expected Succeeded variant"),
             NodeTaskResult::Failed { .. } => panic!("Expected Succeeded variant"),
         }
     }
@@ -733,6 +991,7 @@ mod tests {
                 assert!(!is_client_error);
             }
             NodeTaskResult::Succeeded { .. } => panic!("Expected Failed variant"),
+            NodeTaskResult::ImageSucceeded { .. } => panic!("Expected Failed variant"),
         }
     }
 
@@ -784,7 +1043,7 @@ mod tests {
             model: "deepseek-chat".to_string(),
             choices: vec![CompletionChoice {
                 index: 0,
-                message: MessageContent {
+                message: ChoiceMessage {
                     role: "assistant".to_string(),
                     content: "Test response".to_string(),
                 },
@@ -838,7 +1097,7 @@ mod tests {
         // 反序列化验证（强断言）
         let parsed: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.role, MessageRole::User);
-        assert_eq!(parsed.content, "Hello, world!");
+        assert_eq!(parsed.content.extract_text(), "Hello, world!");
     }
 
     #[test]
@@ -846,26 +1105,26 @@ mod tests {
         let json = r#"{"role":"system","content":"You are a helpful assistant"}"#;
         let msg: Message = serde_json::from_str(json).unwrap();
         assert_eq!(msg.role, MessageRole::System);
-        assert_eq!(msg.content, "You are a helpful assistant");
+        assert_eq!(msg.content.extract_text(), "You are a helpful assistant");
     }
 
     #[test]
     fn test_message_helper_methods() {
         let system_msg = Message::system("System prompt");
         assert_eq!(system_msg.role, MessageRole::System);
-        assert_eq!(system_msg.content, "System prompt");
+        assert_eq!(system_msg.content.extract_text(), "System prompt");
 
         let user_msg = Message::user("User question");
         assert_eq!(user_msg.role, MessageRole::User);
-        assert_eq!(user_msg.content, "User question");
+        assert_eq!(user_msg.content.extract_text(), "User question");
 
         let assistant_msg = Message::assistant("Assistant response");
         assert_eq!(assistant_msg.role, MessageRole::Assistant);
-        assert_eq!(assistant_msg.content, "Assistant response");
+        assert_eq!(assistant_msg.content.extract_text(), "Assistant response");
 
         let tool_msg = Message::tool("Tool output");
         assert_eq!(tool_msg.role, MessageRole::Tool);
-        assert_eq!(tool_msg.content, "Tool output");
+        assert_eq!(tool_msg.content.extract_text(), "Tool output");
     }
 
     // ========================================================================
@@ -877,7 +1136,21 @@ mod tests {
         let msg = Message::user("🚀 My Node 节点 Привет");
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: Message = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.content, "🚀 My Node 节点 Привет");
+        assert_eq!(parsed.content.extract_text(), "🚀 My Node 节点 Привет");
+    }
+
+    /// 验证 MessageContent 拒绝空数组 `[]`（防止多模态数据静默丢弃）
+    #[test]
+    fn test_message_content_rejects_empty_array() {
+        let json = r#"{"role":"user","content":[]}"#;
+        let result: Result<Message, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "MessageContent must reject empty array []");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("non-empty") || err_msg.contains("invalid"),
+            "Error should mention non-empty array, got: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -886,7 +1159,7 @@ mod tests {
         let msg = Message::user(content);
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: Message = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.content, content);
+        assert_eq!(parsed.content.extract_text(), content);
     }
 
     #[test]
@@ -939,5 +1212,31 @@ mod tests {
             let parsed: NodeTaskCompleteAction = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, action);
         }
+    }
+
+    /// 验证 IPv6 方括号 host 提取（复用 ollama 模块的 extract_host_from_url）
+    #[test]
+    fn test_ipv6_bracket_handling() {
+        use crate::client::ollama::extract_host_from_url;
+        // IPv6 with port
+        assert_eq!(
+            extract_host_from_url("http://[::1]:8080/img.png").unwrap(),
+            "::1"
+        );
+        // IPv6 without port
+        assert_eq!(
+            extract_host_from_url("http://[::1]/img.png").unwrap(),
+            "::1"
+        );
+        // Normal IPv4
+        assert_eq!(
+            extract_host_from_url("http://example.com:8080/img.png").unwrap(),
+            "example.com"
+        );
+        // Normal host without port
+        assert_eq!(
+            extract_host_from_url("https://example.com/img.png").unwrap(),
+            "example.com"
+        );
     }
 }

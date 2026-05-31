@@ -5,8 +5,9 @@
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use node_token::protocol::types::{
-    ChatCompletionRequest, Message, MessageRole, NodeCapabilities, NodeHeartbeatRequest,
-    NodeModelCapability, NodeRegisterRequest, NodeTaskEnvelope, NodeTaskPayload,
+    ChatCompletionRequest, Message, MessageContent, MessageRole, NodeCapabilities,
+    NodeHeartbeatRequest, NodeModelCapability, NodeRegisterRequest, NodeTaskEnvelope,
+    NodeTaskPayload,
 };
 use uuid::Uuid;
 
@@ -51,11 +52,11 @@ fn create_chat_request() -> ChatCompletionRequest {
         messages: vec![
             Message {
                 role: MessageRole::System,
-                content: "You are a helpful assistant.".to_string(),
+                content: MessageContent::Text("You are a helpful assistant.".to_string()),
             },
             Message {
                 role: MessageRole::User,
-                content: "Hello, how are you?".to_string(),
+                content: MessageContent::Text("Hello, how are you?".to_string()),
             },
         ],
         temperature: Some(0.7),
@@ -77,7 +78,9 @@ fn create_task_envelope() -> NodeTaskEnvelope {
         complete_grace_until_unix_ms: 1700000060000,
         payload: NodeTaskPayload {
             request_id: Uuid::new_v4(),
-            chat: create_chat_request(),
+            chat: Some(create_chat_request()),
+            image_generation: None,
+            image_edit: None,
         },
     }
 }
@@ -164,22 +167,22 @@ fn bench_task_envelope_deserialize(c: &mut Criterion) {
 
 // ========== 大型负载基准测试 ==========
 
-/// 基准测试：大消息列表序列化
+/// 基准测试:大消息列表序列化
 fn bench_large_chat_request_serialize(c: &mut Criterion) {
     let mut messages = vec![Message {
         role: MessageRole::System,
-        content: "You are an expert programmer.".to_string(),
+        content: MessageContent::Text("You are an expert programmer.".to_string()),
     }];
 
     // 添加 50 条用户/助手消息
     for i in 0..25 {
         messages.push(Message {
             role: MessageRole::User,
-            content: format!("Question {}?", i + 1),
+            content: MessageContent::Text(format!("Question {}?", i + 1)),
         });
         messages.push(Message {
             role: MessageRole::Assistant,
-            content: format!("Answer {} with detailed explanation.", i + 1),
+            content: MessageContent::Text(format!("Answer {} with detailed explanation.", i + 1)),
         });
     }
 

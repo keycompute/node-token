@@ -6,7 +6,6 @@ use thiserror::Error;
 
 /// node-token 主错误类型
 #[derive(Error, Debug)]
-#[allow(dead_code)] // 部分变体在后续阶段使用
 pub enum NodeTokenError {
     /// 配置错误
     #[error("Configuration error: {0}")]
@@ -47,6 +46,14 @@ pub enum NodeTokenError {
     /// 注册失败（如未找到模型）
     #[error("Registration failed: {0}")]
     RegistrationFailed(String),
+
+    /// 图片处理错误
+    #[error("Image processing error: {0}")]
+    Image(String),
+
+    /// 不支持的模型能力
+    #[error("Unsupported capability: {0}")]
+    UnsupportedCapability(String),
 }
 
 // 手动实现 PartialEq（因为某些变体包含不支持 PartialEq 的类型）
@@ -72,6 +79,11 @@ impl PartialEq for NodeTokenError {
             (NodeTokenError::RegistrationFailed(m1), NodeTokenError::RegistrationFailed(m2)) => {
                 m1 == m2
             }
+            (NodeTokenError::Image(m1), NodeTokenError::Image(m2)) => m1 == m2,
+            (
+                NodeTokenError::UnsupportedCapability(m1),
+                NodeTokenError::UnsupportedCapability(m2),
+            ) => m1 == m2,
             // Config 和 Network 包含不支持 PartialEq 的类型，总是返回 false
             _ => false,
         }
@@ -79,7 +91,6 @@ impl PartialEq for NodeTokenError {
 }
 
 /// 存储操作的结果类型
-#[allow(dead_code)] // 在后续阶段使用
 pub type StorageResult<T> = Result<T, NodeTokenError>;
 
 /// 网络请求的结果类型

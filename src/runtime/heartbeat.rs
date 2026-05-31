@@ -1,8 +1,9 @@
+//! 心跳循环逻辑
+//!
+//! 定期向服务端发送心跳，上报当前可接受模型快照，
+//! 镜像服务端返回的节点状态和失败计数。
+
 use std::sync::Arc;
-/// 心跳循环逻辑
-///
-/// 定期向服务端发送心跳，上报当前可接受模型快照，
-/// 镜像服务端返回的节点状态和失败计数。
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -29,7 +30,6 @@ use crate::storage::SessionData;
 /// - 镜像服务端返回的 node_status、server_failure_count、failure_threshold
 /// - 如果节点被 excluded，使用低频心跳（间隔增大 3 倍）
 /// - 网络错误不增加失败计数，继续重试
-#[allow(dead_code)] // 在阶段五使用
 pub async fn heartbeat_loop(
     client: &KeyComputeClient,
     ollama_client: &OllamaClient,

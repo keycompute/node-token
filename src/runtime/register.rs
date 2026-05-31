@@ -1,6 +1,7 @@
-/// 节点注册逻辑
-///
-/// 负责扫描 Ollama 模型、构建注册请求、调用注册 API 并持久化 session。
+//! 节点注册逻辑
+//!
+//! 负责扫描 Ollama 模型、构建注册请求、调用注册 API 并持久化 session。
+
 use tracing::{debug, info};
 
 use crate::client::{KeyComputeClient, OllamaClient};
@@ -12,7 +13,6 @@ use crate::protocol::types::{
 use crate::storage::{LocalStorage, SessionData};
 
 /// 结果类型别名
-#[allow(dead_code)] // 在阶段五使用
 pub type Result<T> = std::result::Result<T, NodeTokenError>;
 
 /// 注册节点到 KeyCompute 服务端
@@ -30,7 +30,6 @@ pub type Result<T> = std::result::Result<T, NodeTokenError>;
 /// - Ollama 扫描失败
 /// - 注册 API 调用失败
 /// - Session 持久化失败
-#[allow(dead_code)] // 在阶段五使用
 pub async fn register_node(
     client: &KeyComputeClient,
     ollama_client: &OllamaClient,
@@ -106,7 +105,6 @@ pub async fn register_node(
 /// # 返回
 /// - `Some(SessionData)`: 找到本地 session
 /// - `None`: 无本地 session，需要执行新注册
-#[allow(dead_code)] // 在阶段五使用
 pub fn try_load_session(storage: &LocalStorage) -> Result<Option<SessionData>> {
     debug!("Attempting to load session from local storage...");
 

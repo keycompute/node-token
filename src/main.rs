@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
         .await;
     });
 
-    // 9. 等待退出信号
+    // 10. 等待退出信号
     wait_for_signal().await;
     info!("Received shutdown signal, stopping...");
     stop_signal.store(true, Ordering::Relaxed);

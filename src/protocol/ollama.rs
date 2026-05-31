@@ -22,6 +22,9 @@ pub struct OllamaMessage {
     pub role: String,
     /// 消息内容
     pub content: String,
+    /// 图片列表（base64 编码，不含 data URI 前缀）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<String>>,
 }
 
 impl OllamaMessage {
@@ -30,6 +33,21 @@ impl OllamaMessage {
         Self {
             role: role.into(),
             content: content.into(),
+            images: None,
+        }
+    }
+
+    /// 创建带图片的消息
+    #[allow(dead_code)]
+    pub fn with_images(
+        role: impl Into<String>,
+        content: impl Into<String>,
+        images: Vec<String>,
+    ) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            images: Some(images),
         }
     }
 }
@@ -217,5 +235,31 @@ mod tests {
             let msg = OllamaMessage::new(role, "test content");
             assert_eq!(msg.role, role);
         }
+    }
+
+    #[test]
+    /// 验证带图片的 OllamaMessage 序列化
+    fn test_ollama_message_with_images() {
+        let msg = OllamaMessage::with_images(
+            "user",
+            "Describe this image",
+            vec!["iVBORw0KGgoAAAANSUhEUgAAAA".to_string()],
+        );
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"images\""));
+        assert!(json.contains("iVBORw0KGgoAAAANSUhEUgAAAA"));
+
+        let parsed: OllamaMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.role, "user");
+        assert_eq!(parsed.content, "Describe this image");
+        assert_eq!(parsed.images.unwrap().len(), 1);
+    }
+
+    #[test]
+    /// 验证不带图片的 OllamaMessage 不序列化 images 字段
+    fn test_ollama_message_without_images() {
+        let msg = OllamaMessage::new("user", "Hello");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("images"));
     }
 }

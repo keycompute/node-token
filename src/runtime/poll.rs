@@ -1,7 +1,8 @@
+//! 轮询循环逻辑
+//!
+//! 定期从服务端领取任务，提交到执行器执行。
+
 use std::sync::Arc;
-/// 轮询循环逻辑
-///
-/// 定期从服务端领取任务，提交到执行器执行。
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -40,7 +41,6 @@ pub struct PollLoopConfig {
 /// - 网络错误指数退避（AGENTS.md 第 724 行）
 /// - 无任务时等待间隔 = poll_timeout_secs / 10（默认 1 秒）
 /// - 领取任务前需要获取并发许可，达到上限时阻塞等待
-#[allow(dead_code)] // 在阶段五使用
 pub async fn poll_loop(
     client: &KeyComputeClient,
     session: &SessionData,
@@ -55,11 +55,11 @@ pub async fn poll_loop(
     let mut consecutive_failures: u32 = 0;
     let max_backoff = Duration::from_secs(16);
 
-    // 计算无任务时的等待间隔：poll_timeout_secs / 10，默认 1 秒
-    let empty_poll_interval = if config.poll_timeout_secs > 0 {
+    // 计算无任务时的等待间隔：poll_timeout_secs / 10，至少 1 秒
+    let empty_poll_interval = if config.poll_timeout_secs >= 10 {
         Duration::from_secs(config.poll_timeout_secs / 10)
     } else {
-        Duration::from_secs(1) // 默认 1 秒
+        Duration::from_secs(1) // 默认 1 秒，避免 poll_timeout_secs < 10 时除出 0
     };
 
     info!(
@@ -222,36 +222,31 @@ mod tests {
 
     #[test]
     /// 验证空轮询间隔计算。
-    /// 无任务时的等待间隔 = poll_timeout_secs / 10
+    /// 无任务时的等待间隔 = poll_timeout_secs / 10，至少 1 秒
     fn test_empty_poll_interval_calculation() {
         // poll_timeout_secs = 20，间隔 = 2 秒
-        let interval_1 = if 20 > 0 {
+        let interval_20 = if 20 >= 10 {
             Duration::from_secs(20 / 10)
-        } else {
-            Duration::from_secs(1) // 默认值
-        };
-        assert_eq!(interval_1, Duration::from_secs(2));
-
-        // poll_timeout_secs = 30，间隔 = 3 秒
-        let interval_2 = if 30 > 0 {
-            Duration::from_secs(30 / 10)
-        } else {
-            Duration::from_secs(1) // 默认值
-        };
-        assert_eq!(interval_2, Duration::from_secs(3));
-
-        // poll_timeout_secs = 5，间隔 = 0 秒（整数除法），使用默认 1 秒
-        let interval_3 = if 5 > 0 {
-            let calculated = 5 / 10; // = 0
-            if calculated > 0 {
-                Duration::from_secs(calculated)
-            } else {
-                Duration::from_secs(1) // 使用默认值
-            }
         } else {
             Duration::from_secs(1)
         };
-        assert_eq!(interval_3, Duration::from_secs(1));
+        assert_eq!(interval_20, Duration::from_secs(2));
+
+        // poll_timeout_secs = 30，间隔 = 3 秒
+        let interval_30 = if 30 >= 10 {
+            Duration::from_secs(30 / 10)
+        } else {
+            Duration::from_secs(1)
+        };
+        assert_eq!(interval_30, Duration::from_secs(3));
+
+        // poll_timeout_secs = 5，< 10，fallback 到 1 秒
+        let interval_5 = if 5 >= 10 {
+            Duration::from_secs(5 / 10)
+        } else {
+            Duration::from_secs(1)
+        };
+        assert_eq!(interval_5, Duration::from_secs(1));
     }
 
     #[test]
