@@ -158,18 +158,21 @@ pub struct NodeTaskEnvelope {
 }
 
 /// 节点任务载荷
+///
+/// 支持三种任务类型（互斥）：Chat 完成、图片生成、图片编辑。
+/// 三个字段至多设置一个；若全部为 `None` 则视为无效 payload。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeTaskPayload {
     /// 请求 ID
     pub request_id: Uuid,
     /// Chat 完成请求（可选，与图片生成/编辑互斥）
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat: Option<ChatCompletionRequest>,
     /// 图片生成请求（可选）
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_generation: Option<ImageGenerationRequest>,
     /// 图片编辑请求（可选）
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_edit: Option<ImageEditRequest>,
 }
 
@@ -187,6 +190,20 @@ impl NodeTaskPayload {
     /// 是否为图片编辑任务
     pub fn is_image_edit(&self) -> bool {
         self.image_edit.is_some()
+    }
+
+    /// 校验 payload 合法性：至多设置一种任务类型，且不能全部为空。
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let count = self.chat.is_some() as u8
+            + self.image_generation.is_some() as u8
+            + self.image_edit.is_some() as u8;
+        if count > 1 {
+            return Err("NodeTaskPayload: more than one task type set");
+        }
+        if count == 0 {
+            return Err("NodeTaskPayload: no task type set");
+        }
+        Ok(())
     }
 }
 
@@ -575,14 +592,18 @@ pub struct Usage {
 // ============================================================================
 
 /// 图片生成请求
+///
+/// `prompt` 为文本提示词，`n` 和 `size` 为可选参数（参照 OpenAI Images API）。
+/// 注意：当通过 Ollama `/api/generate` 执行时，`n` 和 `size` 参数会被忽略
+///（Ollama generate API 不支持多图/尺寸控制），仅发出 warning 日志。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageGenerationRequest {
     /// 生成提示词
     pub prompt: String,
-    /// 生成图片数量（可选，默认 1）
+    /// 生成图片数量（可选，默认 1），如 `2`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n: Option<u32>,
-    /// 图片尺寸（可选）
+    /// 图片尺寸（可选），如 `"1024x1024"`、`"512x512"`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
 }

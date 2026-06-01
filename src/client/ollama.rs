@@ -119,6 +119,13 @@ pub(crate) fn extract_host_from_url(url: &str) -> OllamaResult<&str> {
 /// 1. 如果 host 已经是 IP 字面量，直接用 is_private_ip 检查
 /// 2. 否则解析 DNS，检查所有解析出的 IP 均为公网地址
 ///
+/// # 重要：调用方必须包裹超时
+///
+/// 本函数内部使用 `tokio::net::lookup_host` 进行 DNS 解析，
+/// 该调用**没有内置超时**——网络不通时可能永久挂起。
+/// **所有调用方必须用 `tokio::time::timeout` 包裹本函数**。
+/// 当前唯一调用方 `download_image_to_base64` 使用 10s DNS 超时。
+///
 /// 注意：DNS 预检与 reqwest 实际 DNS 解析之间存在 TOCTOU 窗口，
 /// 但配合禁止重定向 + Content-Type 校验 + 大小限制，实际风险极低。
 async fn validate_dns_no_private(url: &str) -> OllamaResult<()> {
@@ -270,6 +277,7 @@ impl OllamaClient {
     /// 下载远程图片并编码为 base64 data URI
     ///
     /// 安全措施：
+    /// - DNS 预检解析（10s 独立超时，防止网络不通时挂起）
     /// - 最大 20MB 限制
     /// - 禁止重定向（防 SSRF）
     /// - 校验 Content-Type 为 image/*
@@ -282,7 +290,17 @@ impl OllamaClient {
         }
 
         // 防 SSRF: DNS 预检，验证实际 IP 非私有地址（防 DNS 重绑定攻击）
-        validate_dns_no_private(url).await?;
+        // 使用 10s 超时包裹，防止网络不通时 tokio::net::lookup_host 永久挂起
+        const DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        tokio::time::timeout(DNS_TIMEOUT, validate_dns_no_private(url))
+            .await
+            .map_err(|_| {
+                NodeTokenError::Image(format!(
+                    "DNS resolution timed out ({}s) for image host: {}",
+                    DNS_TIMEOUT.as_secs(),
+                    url
+                ))
+            })??;
 
         debug!("Downloading image from: {}", url);
 

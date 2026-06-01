@@ -90,6 +90,19 @@ impl TaskExecutor {
             task_id, envelope.model, deadline_ms, grace_until_ms
         );
 
+        // 0. 校验 payload 互斥性
+        if let Err(e) = envelope.payload.validate() {
+            error!("Task {} payload validation failed: {}", task_id, e);
+            let result = NodeTaskResult::Failed {
+                code: "invalid_payload".to_string(),
+                message: e.to_string(),
+                is_client_error: true,
+            };
+            self.complete_with_retry(task_id, lease_id, result, deadline_ms, grace_until_ms)
+                .await;
+            return;
+        }
+
         // 1. 根据任务类型路由
         let result = if envelope.payload.is_chat() {
             match self.execute_chat(&envelope).await {
