@@ -141,17 +141,43 @@ pub async fn heartbeat_loop(
                     .unwrap_or_else(|| registered_models.clone())
             };
 
-            // 取注册模型和当前模型的交集
+            // 取注册模型和当前模型的交集：
+            // 服务端强制校验 accepted_models 必须是注册列表的子集
             let active_models: Vec<String> = registered_models
                 .into_iter()
                 .filter(|m| current_models.contains(m))
                 .collect();
 
-            // 仅在扫描时才检查模型变化，减少日志噪音
-            if (do_scan || heartbeat_count == 1)
-                && active_models.len() != session.capabilities.models.len()
-            {
-                if active_models.is_empty() {
+            if do_scan || heartbeat_count == 1 {
+                info!(
+                    "Accepted models (schedulable): {:?}",
+                    active_models
+                );
+            }
+
+            // 新模型（不在注册列表中）不会被 accepted_models 包含，
+            // 受限于服务端设计：capabilities_json 在注册时写入后不再更新，
+            // 且心跳强制校验 accepted_models 必须是注册列表的子集。
+            // 新模型需联系管理员更新数据库中 nodes.capabilities_json 后重启。
+                        
+            // 检测模型删除：注册中有的模型在当前 Ollama 中不再存在
+            // 注意：不能通过 active_models 长度判断，因为新模型也会被加入
+            let removed: Vec<&String> = session
+                .capabilities
+                .models
+                .iter()
+                .map(|m| &m.model)
+                .filter(|reg_m| {
+                    // cached_models 为 None（Ollama 扫描失败）时不做删除判定
+                    cached_models
+                        .as_ref()
+                        .map(|c| !c.contains(*reg_m))
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            if !removed.is_empty() {
+                if removed.len() == session.capabilities.models.len() {
                     error!(
                         "All registered models have been removed from Ollama. \
                          Node will not receive any tasks. \
@@ -163,16 +189,11 @@ pub async fn heartbeat_loop(
                             .map(|m| &m.model)
                             .collect::<Vec<_>>()
                     );
-                } else {
+                } else if do_scan || heartbeat_count == 1 {
                     warn!(
                         "Some registered models no longer available in Ollama. \
-                         Registered: {:?}, Active: {:?}",
-                        session
-                            .capabilities
-                            .models
-                            .iter()
-                            .map(|m| &m.model)
-                            .collect::<Vec<_>>(),
+                         Removed: {:?}, Remaining: {:?}",
+                        removed,
                         active_models
                     );
                 }
