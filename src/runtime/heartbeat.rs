@@ -149,35 +149,28 @@ pub async fn heartbeat_loop(
                 .collect();
 
             if do_scan || heartbeat_count == 1 {
-                info!(
-                    "Accepted models (schedulable): {:?}",
-                    active_models
-                );
+                info!("Accepted models (schedulable): {:?}", active_models);
             }
 
             // 新模型（不在注册列表中）不会被 accepted_models 包含，
             // 受限于服务端设计：capabilities_json 在注册时写入后不再更新，
             // 且心跳强制校验 accepted_models 必须是注册列表的子集。
             // 新模型需联系管理员更新数据库中 nodes.capabilities_json 后重启。
-                        
-            // 检测模型删除：注册中有的模型在当前 Ollama 中不再存在
+
+            // 检测模型删除：注册模型在当前 Ollama 中不再存在
             // 注意：不能通过 active_models 长度判断，因为新模型也会被加入
             let removed: Vec<&String> = session
                 .capabilities
                 .models
                 .iter()
                 .map(|m| &m.model)
-                .filter(|reg_m| {
-                    // cached_models 为 None（Ollama 扫描失败）时不做删除判定
-                    cached_models
-                        .as_ref()
-                        .map(|c| !c.contains(*reg_m))
-                        .unwrap_or(false)
-                })
+                .filter(|reg_m| !current_models.contains(*reg_m))
                 .collect();
 
             if !removed.is_empty() {
-                if removed.len() == session.capabilities.models.len() {
+                if removed.len() == session.capabilities.models.len()
+                    && (do_scan || heartbeat_count == 1)
+                {
                     error!(
                         "All registered models have been removed from Ollama. \
                          Node will not receive any tasks. \
@@ -193,8 +186,7 @@ pub async fn heartbeat_loop(
                     warn!(
                         "Some registered models no longer available in Ollama. \
                          Removed: {:?}, Remaining: {:?}",
-                        removed,
-                        active_models
+                        removed, active_models
                     );
                 }
             }
