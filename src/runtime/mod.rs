@@ -13,6 +13,6 @@ pub mod register;
 
 // 重新导出主要类型和函数，方便外部使用
 pub use executor::TaskExecutor;
-pub use heartbeat::heartbeat_loop;
+pub use heartbeat::{HeartbeatContext, heartbeat_loop};
 pub use poll::{PollLoopConfig, poll_loop};
 pub use register::{register_node, try_load_session};

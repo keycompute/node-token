@@ -10,6 +10,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
 
 use crate::client::KeyComputeClient;
+use crate::error::NodeTokenError;
 use crate::protocol::types::NodePollRequest;
 use crate::runtime::executor::TaskExecutor;
 use crate::storage::SessionData;
@@ -33,6 +34,7 @@ pub struct PollLoopConfig {
 /// - `is_excluded`: 节点排除标志（由 heartbeat 循环更新）
 /// - `stop_signal`: 退出信号
 /// - `config`: Poll 循环配置参数
+/// - `session_lost`: Session 失效信号（401 时置 true，通知 main 触发重注册）
 ///
 /// # 行为
 /// - 定期调用 poll API 领取任务
@@ -41,6 +43,7 @@ pub struct PollLoopConfig {
 /// - 网络错误指数退避（AGENTS.md 第 724 行）
 /// - 无任务时等待间隔 = poll_timeout_secs / 10（默认 1 秒）
 /// - 领取任务前需要获取并发许可，达到上限时阻塞等待
+/// - 收到 401 Invalid session token 时置 session_lost 并立即退出循环
 pub async fn poll_loop(
     client: &KeyComputeClient,
     session: &SessionData,
@@ -48,6 +51,7 @@ pub async fn poll_loop(
     is_excluded: Arc<AtomicBool>,
     stop_signal: Arc<AtomicBool>,
     config: PollLoopConfig,
+    session_lost: Arc<AtomicBool>,
 ) {
     info!("Starting poll loop");
 
@@ -138,6 +142,14 @@ pub async fn poll_loop(
                 }
             }
             Err(e) => {
+                // 关键：检测服务端返回 401 → session 失效 → 触发自愈
+                if NodeTokenError::is_session_invalid(&e) {
+                    error!("Poll: session invalid on server (401), triggering re-registration");
+                    session_lost.store(true, Ordering::Release);
+                    // 立即退出，让 main.rs 处理重注册流程
+                    return;
+                }
+
                 error!("Poll failed: {}", e);
                 // 网络错误指数退避（AGENTS.md 第 724 行）
                 consecutive_failures += 1;

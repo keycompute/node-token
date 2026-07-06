@@ -4,6 +4,7 @@
 //! 并将结果提交回服务端。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Utc;
 use tokio_retry::Retry;
@@ -47,12 +48,8 @@ pub struct TaskExecutor {
     ollama_client: Arc<OllamaClient>,
     /// 当前 session 信息
     session: SessionData,
-    /// 镜像的服务端节点状态
-    node_status: Arc<tokio::sync::Mutex<String>>,
-    /// 镜像的服务端失败计数
-    server_failure_count: Arc<tokio::sync::Mutex<u32>>,
-    /// 镜像的服务端失败阈值
-    failure_threshold: Arc<tokio::sync::Mutex<u32>>,
+    /// Session 失效信号（401 时置 true，通知 main 触发重注册）
+    session_lost: Arc<AtomicBool>,
 }
 
 impl TaskExecutor {
@@ -61,14 +58,13 @@ impl TaskExecutor {
         client: Arc<KeyComputeClient>,
         ollama_client: Arc<OllamaClient>,
         session: SessionData,
+        session_lost: Arc<AtomicBool>,
     ) -> Self {
         Self {
             client,
             ollama_client,
             session,
-            node_status: Arc::new(tokio::sync::Mutex::new("unknown".to_string())),
-            server_failure_count: Arc::new(tokio::sync::Mutex::new(0)),
-            failure_threshold: Arc::new(tokio::sync::Mutex::new(3)),
+            session_lost,
         }
     }
 
@@ -346,23 +342,29 @@ impl TaskExecutor {
                         "Task {} completed (one-shot): action={:?}",
                         task_id, resp.action
                     );
-                    *self.node_status.lock().await = resp.node_status.clone();
-                    *self.server_failure_count.lock().await = resp.server_failure_count;
-                    *self.failure_threshold.lock().await = resp.failure_threshold;
                     self.log_complete_response(task_id, &resp);
                 }
                 Err(e) => {
+                    if NodeTokenError::is_session_invalid(&e) {
+                        error!(
+                            "Task {} one-shot complete: session invalid (401), signaling re-registration",
+                            task_id
+                        );
+                        self.session_lost.store(true, Ordering::Release);
+                    }
                     error!("Task {} one-shot complete failed: {}", task_id, e);
                 }
             }
             return;
         }
 
-        let max_retries =
-            std::cmp::max(1, (max_retry_duration as f64 / 1000.0).ceil() as usize / 5);
+        // 每 5 秒一次重试，最多重试次数由 deadline 剩余时间决定
+        let retry_interval_secs: u64 = 5;
+        let remaining_secs = (max_retry_duration as u64) / 1000;
+        let max_retries: usize = std::cmp::max(1, (remaining_secs / retry_interval_secs) as usize);
 
         let retry_strategy = ExponentialBackoff::from_millis(100)
-            .max_delay(std::time::Duration::from_secs(5))
+            .max_delay(std::time::Duration::from_secs(retry_interval_secs))
             .take(max_retries);
 
         info!(
@@ -374,13 +376,14 @@ impl TaskExecutor {
             match self.client.complete(task_id, &req).await {
                 Ok(resp) => {
                     info!("Task {} completed: action={:?}", task_id, resp.action);
-                    *self.node_status.lock().await = resp.node_status.clone();
-                    *self.server_failure_count.lock().await = resp.server_failure_count;
-                    *self.failure_threshold.lock().await = resp.failure_threshold;
                     self.log_complete_response(task_id, &resp);
                     Ok(resp)
                 }
                 Err(e) => {
+                    if NodeTokenError::is_session_invalid(&e) {
+                        error!("Complete retry for task {}: session invalid (401), signaling re-registration", task_id);
+                        self.session_lost.store(true, Ordering::Release);
+                    }
                     warn!("Complete failed for task {}: {}", task_id, e);
                     Err(e)
                 }
@@ -454,9 +457,7 @@ impl Clone for TaskExecutor {
             client: self.client.clone(),
             ollama_client: self.ollama_client.clone(),
             session: self.session.clone(),
-            node_status: self.node_status.clone(),
-            server_failure_count: self.server_failure_count.clone(),
-            failure_threshold: self.failure_threshold.clone(),
+            session_lost: self.session_lost.clone(),
         }
     }
 }
@@ -485,7 +486,12 @@ mod tests {
             poll_timeout_secs: 30,
         };
 
-        TaskExecutor::new(client, ollama_client, session)
+        TaskExecutor::new(
+            client,
+            ollama_client,
+            session,
+            Arc::new(AtomicBool::new(false)),
+        )
     }
 
     #[test]

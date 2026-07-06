@@ -256,10 +256,10 @@ impl OllamaClient {
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
             error!("Ollama chat failed with status {}: {}", status, body);
-            return Err(NodeTokenError::HttpError {
-                status,
-                message: body,
-            });
+            return Err(NodeTokenError::Ollama(format!(
+                "Ollama chat API returned HTTP {}: {}",
+                status, body
+            )));
         }
 
         let chat_response: OllamaChatResponse = response.json().await.map_err(|e| {

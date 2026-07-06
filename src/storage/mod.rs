@@ -8,6 +8,8 @@ use crate::protocol::types::{NodeCapabilities, NodeId, NodeSessionId};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(not(unix))]
+use tracing::warn;
 use tracing::{debug, info};
 
 /// Session 数据（本地持久化）
@@ -84,6 +86,7 @@ impl LocalStorage {
     /// # Security
     /// - 文件权限设置为 600（仅 owner 可读写）
     /// - 日志中不得输出 session_token 明文
+    /// - 使用原子写入（先写临时文件再 rename），防止崩溃导致数据损坏
     pub fn save_session(&self, session: &SessionData) -> StorageResult<()> {
         debug!(
             "Saving session to file: node_id={}, session_id={}",
@@ -95,30 +98,37 @@ impl LocalStorage {
             NodeTokenError::Storage(format!("Failed to serialize session data: {}", e))
         })?;
 
-        // 写入文件
-        fs::write(&self.session_file, &json)
-            .map_err(|e| NodeTokenError::Storage(format!("Failed to write session file: {}", e)))?;
+        // 原子写入：先写临时文件，再 rename
+        // 防止进程崩溃时留下损坏的 session.json
+        let tmp_file = self.session_file.with_extension("json.tmp");
+        fs::write(&tmp_file, &json).map_err(|e| {
+            NodeTokenError::Storage(format!("Failed to write session temp file: {}", e))
+        })?;
 
         // 设置文件权限为 600（仅 owner 可读写）
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&self.session_file)
+            let mut perms = fs::metadata(&tmp_file)
                 .map_err(|e| {
-                    NodeTokenError::Storage(format!("Failed to read file metadata: {}", e))
+                    NodeTokenError::Storage(format!("Failed to read temp file metadata: {}", e))
                 })?
                 .permissions();
-            perms.set_mode(0o600); // rw-------
-            fs::set_permissions(&self.session_file, perms).map_err(|e| {
-                NodeTokenError::Storage(format!("Failed to set file permissions: {}", e))
+            perms.set_mode(0o600);
+            fs::set_permissions(&tmp_file, perms).map_err(|e| {
+                NodeTokenError::Storage(format!("Failed to set temp file permissions: {}", e))
             })?;
-            debug!("Set session file permissions to 600");
         }
 
         #[cfg(not(unix))]
         {
             warn!("File permissions setting is not supported on this platform");
         }
+
+        // 原子 rename（POSIX 保证同一文件系统内 rename 是原子的）
+        fs::rename(&tmp_file, &self.session_file).map_err(|e| {
+            NodeTokenError::Storage(format!("Failed to rename session file: {}", e))
+        })?;
 
         info!("Session saved successfully to {:?}", self.session_file);
         Ok(())

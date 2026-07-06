@@ -244,6 +244,7 @@ mod tests {
             heartbeat_interval_secs: 30,
             excluded_poll_check_interval_secs: 30,
             max_concurrent_tasks: 2,
+            max_reregisters: 3,
             data_dir: None,
         };
 
@@ -336,6 +337,7 @@ mod tests {
             heartbeat_interval_secs: 30,
             excluded_poll_check_interval_secs: 30,
             max_concurrent_tasks: 2,
+            max_reregisters: 3,
             data_dir: None,
         };
 

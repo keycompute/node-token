@@ -11,8 +11,24 @@ use tracing::{error, info, warn};
 
 use crate::client::{KeyComputeClient, OllamaClient};
 use crate::config::NodeTokenConfig;
+use crate::error::NodeTokenError;
 use crate::protocol::types::NodeHeartbeatRequest;
 use crate::storage::SessionData;
+
+/// 模型扫描间隔：每 10 次心跳扫描一次（默认心跳 30s → 每 5 分钟扫描一次）
+const MODEL_SCAN_HEARTBEAT_INTERVAL: u32 = 10;
+
+/// 心跳上下文：携带控制信号和状态标志，减少函数参数数量
+pub struct HeartbeatContext {
+    /// 节点排除标志（与 poll 循环共享）
+    pub is_excluded: Arc<AtomicBool>,
+    /// 退出信号
+    pub stop_signal: Arc<AtomicBool>,
+    /// Session 失效信号（401 时置 true，通知 main 触发重注册）
+    pub session_lost: Arc<AtomicBool>,
+    /// 首次心跳完成后发送信号（通知 main 初始状态已就绪）
+    pub first_hb_signal: Option<tokio::sync::oneshot::Sender<()>>,
+}
 
 /// 心跳循环
 ///
@@ -21,8 +37,7 @@ use crate::storage::SessionData;
 /// - `ollama_client`: Ollama HTTP 客户端
 /// - `session`: 当前 session 信息
 /// - `config`: 节点配置
-/// - `is_excluded`: 节点排除标志（与 poll 循环共享）
-/// - `stop_signal`: 退出信号
+/// - `ctx`: 心跳上下文（包含控制信号和状态标志）
 ///
 /// # 行为
 /// - 定期发送心跳（间隔由 config.heartbeat_interval_secs 控制）
@@ -30,20 +45,21 @@ use crate::storage::SessionData;
 /// - 镜像服务端返回的 node_status、server_failure_count、failure_threshold
 /// - 如果节点被 excluded，使用低频心跳（间隔增大 3 倍）
 /// - 网络错误不增加失败计数，继续重试
+/// - 收到 401 Invalid session token 时置 session_lost 并立即退出循环
 pub async fn heartbeat_loop(
     client: &KeyComputeClient,
     ollama_client: &OllamaClient,
     session: &SessionData,
     config: &NodeTokenConfig,
-    is_excluded: Arc<AtomicBool>,
-    stop_signal: Arc<AtomicBool>,
+    mut ctx: HeartbeatContext,
 ) {
     let base_interval = Duration::from_secs(config.heartbeat_interval_secs);
     let mut current_interval = base_interval;
     let mut interval = tokio::time::interval(current_interval);
 
     // 第一次立即触发，不等待完整间隔
-    // 这样 main.rs 中的初始等待（2 秒）后，is_excluded 已被第一次心跳更新
+    // 第一次心跳完成后通过 oneshot channel 通知 main.rs，
+    // 避免使用固定延迟等待（原 2s 硬编码已移除）
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     info!(
@@ -54,13 +70,21 @@ pub async fn heartbeat_loop(
     // 连续失败计数，用于日志记录
     let mut consecutive_failures: u32 = 0;
 
-    while !stop_signal.load(Ordering::Relaxed) {
+    // 心跳迭代计数，用于控制模型扫描频率
+    let mut heartbeat_count: u32 = 0;
+
+    // 缓存的模型列表（只在需要时刷新）
+    let mut cached_models: Option<Vec<String>> = None;
+
+    while !ctx.stop_signal.load(Ordering::Relaxed) {
         interval.tick().await;
+        heartbeat_count += 1;
 
         // 获取上报的模型列表
         // 设计意图：
         // 1. 正常情况下，使用注册时的 capabilities（保证是注册能力的子集）
         // 2. 如果注册时为空（启动时机问题），则重新扫描 Ollama（容错处理）
+        // 3. 非空注册模型每隔 MODEL_SCAN_HEARTBEAT_INTERVAL 次心跳扫描一次
         let registered_models: Vec<String> = session
             .capabilities
             .models
@@ -78,66 +102,83 @@ pub async fn heartbeat_loop(
                             "Registration had empty models, using current Ollama models: {:?}",
                             current_models
                         );
+                        cached_models = Some(current_models.clone());
                     }
                     current_models
                 }
                 Err(e) => {
                     warn!("Failed to list Ollama models for heartbeat: {}", e);
                     // Ollama 不可用，跳过本次心跳，下次重试
+                    if ctx.first_hb_signal.is_some() {
+                        let _ = ctx.first_hb_signal.take().unwrap().send(());
+                    }
                     continue;
                 }
             }
         } else {
             // 正常情况：使用注册时的 capabilities
-            // 但需要过滤掉当前 Ollama 中不存在的模型（模型被删除的情况）
-            match ollama_client.list_models().await {
-                Ok(current_models) => {
-                    let current_models: Vec<String> = current_models;
-                    // 取注册模型和当前模型的交集
-                    let active_models: Vec<String> = registered_models
-                        .into_iter()
-                        .filter(|m| current_models.contains(m))
-                        .collect();
+            // 模型扫描按固定心跳间隔进行，避免每次心跳都调用 Ollama API
+            let do_scan = heartbeat_count % MODEL_SCAN_HEARTBEAT_INTERVAL == 1;
 
-                    // 检查是否有模型被删除
-                    if active_models.len() != session.capabilities.models.len() {
-                        if active_models.is_empty() {
-                            // 严重情况：所有注册模型都被删除
-                            error!(
-                                "All registered models have been removed from Ollama. \
-                                 Node will not receive any tasks. \
-                                 Registered: {:?}, Please pull models back.",
-                                session
-                                    .capabilities
-                                    .models
-                                    .iter()
-                                    .map(|m| &m.model)
-                                    .collect::<Vec<_>>()
-                            );
-                        } else {
-                            // 部分模型被删除
-                            warn!(
-                                "Some registered models no longer available in Ollama. \
-                                 Registered: {:?}, Active: {:?}",
-                                session
-                                    .capabilities
-                                    .models
-                                    .iter()
-                                    .map(|m| &m.model)
-                                    .collect::<Vec<_>>(),
-                                active_models
-                            );
-                        }
+            let current_models: Vec<String> = if do_scan || cached_models.is_none() {
+                match ollama_client.list_models().await {
+                    Ok(models) => {
+                        cached_models = Some(models.clone());
+                        models
                     }
-
-                    active_models
+                    Err(e) => {
+                        warn!("Failed to list Ollama models for heartbeat: {}", e);
+                        // 使用缓存或注册模型
+                        cached_models
+                            .clone()
+                            .unwrap_or_else(|| registered_models.clone())
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to list Ollama models for heartbeat: {}", e);
-                    // Ollama 不可用，使用注册时的模型（保守策略）
-                    registered_models
+            } else {
+                // 使用缓存，不扫描 Ollama
+                cached_models
+                    .clone()
+                    .unwrap_or_else(|| registered_models.clone())
+            };
+
+            // 取注册模型和当前模型的交集
+            let active_models: Vec<String> = registered_models
+                .into_iter()
+                .filter(|m| current_models.contains(m))
+                .collect();
+
+            // 仅在扫描时才检查模型变化，减少日志噪音
+            if (do_scan || heartbeat_count == 1)
+                && active_models.len() != session.capabilities.models.len()
+            {
+                if active_models.is_empty() {
+                    error!(
+                        "All registered models have been removed from Ollama. \
+                         Node will not receive any tasks. \
+                         Registered: {:?}, Please pull models back.",
+                        session
+                            .capabilities
+                            .models
+                            .iter()
+                            .map(|m| &m.model)
+                            .collect::<Vec<_>>()
+                    );
+                } else {
+                    warn!(
+                        "Some registered models no longer available in Ollama. \
+                         Registered: {:?}, Active: {:?}",
+                        session
+                            .capabilities
+                            .models
+                            .iter()
+                            .map(|m| &m.model)
+                            .collect::<Vec<_>>(),
+                        active_models
+                    );
                 }
             }
+
+            active_models
         };
 
         let req = NodeHeartbeatRequest {
@@ -162,9 +203,9 @@ pub async fn heartbeat_loop(
                 );
 
                 // 更新 excluded 标志（通知 poll 循环）
-                let was_excluded = is_excluded.load(Ordering::Relaxed);
+                let was_excluded = ctx.is_excluded.load(Ordering::Acquire);
                 let now_excluded = resp.node_status == "excluded";
-                is_excluded.store(now_excluded, Ordering::Relaxed);
+                ctx.is_excluded.store(now_excluded, Ordering::Release);
 
                 if now_excluded && !was_excluded {
                     warn!("Node has been EXCLUDED - will stop poll but continue heartbeat");
@@ -190,8 +231,27 @@ pub async fn heartbeat_loop(
                         resp.node_status
                     );
                 }
+
+                // 首次心跳完成后通知 main
+                if let Some(tx) = ctx.first_hb_signal.take() {
+                    let _ = tx.send(());
+                }
             }
             Err(e) => {
+                // 关键：检测服务端返回 401 → session 失效 → 触发自愈
+                if NodeTokenError::is_session_invalid(&e) {
+                    error!(
+                        "Heartbeat: session invalid on server (401), triggering re-registration"
+                    );
+                    ctx.session_lost.store(true, Ordering::Release);
+                    // 首次心跳 401 也需通知 main，避免无限等待
+                    if let Some(tx) = ctx.first_hb_signal.take() {
+                        let _ = tx.send(());
+                    }
+                    // 立即退出，让 main.rs 处理重注册流程
+                    return;
+                }
+
                 consecutive_failures += 1;
                 error!(
                     "Heartbeat failed (consecutive={}): {}",

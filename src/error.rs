@@ -56,6 +56,16 @@ pub enum NodeTokenError {
     UnsupportedCapability(String),
 }
 
+impl NodeTokenError {
+    /// 判断错误是否为 session 无效（HTTP 401）
+    ///
+    /// 当服务端返回 401 Invalid session token 时，客户端应清除本地
+    /// session 并重新注册，而不是无限重试。
+    pub fn is_session_invalid(&self) -> bool {
+        matches!(self, NodeTokenError::HttpError { status: 401, .. })
+    }
+}
+
 // 手动实现 PartialEq（因为某些变体包含不支持 PartialEq 的类型）
 impl PartialEq for NodeTokenError {
     fn eq(&self, other: &Self) -> bool {

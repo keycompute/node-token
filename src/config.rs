@@ -71,6 +71,11 @@ pub struct NodeTokenConfig {
     /// 本地数据目录，默认 ~/.local/share/node-token
     #[serde(default = "default_data_dir")]
     pub data_dir: Option<String>,
+
+    /// 401 自愈最大重注册次数，默认 3
+    /// 超过此次数后进程退出，防止无限重试
+    #[serde(default = "default_max_reregisters")]
+    pub max_reregisters: u32,
 }
 
 fn default_ollama_url() -> String {
@@ -87,6 +92,10 @@ fn default_excluded_poll_check_interval() -> u64 {
 
 fn default_max_concurrent_tasks() -> usize {
     2
+}
+
+fn default_max_reregisters() -> u32 {
+    3
 }
 
 fn default_data_dir() -> Option<String> {
@@ -158,6 +167,7 @@ pub fn load_config() -> Result<NodeTokenConfig> {
         .set_default("heartbeat_interval_secs", 30)?
         .set_default("excluded_poll_check_interval_secs", 30)?
         .set_default("max_concurrent_tasks", 2)?
+        .set_default("max_reregisters", 3)?
         // 从配置文件加载
         .add_source(File::with_name(&config_path).required(false))
         // 从环境变量加载（优先级最高）
@@ -205,6 +215,7 @@ mod tests {
             heartbeat_interval_secs: default_heartbeat_interval(),
             excluded_poll_check_interval_secs: default_excluded_poll_check_interval(),
             max_concurrent_tasks: default_max_concurrent_tasks(),
+            max_reregisters: 3,
             data_dir: None,
         };
 
@@ -224,6 +235,7 @@ mod tests {
             heartbeat_interval_secs: 30,
             excluded_poll_check_interval_secs: 30,
             max_concurrent_tasks: 2,
+            max_reregisters: 3,
             data_dir: Some("/tmp/test-node-token".to_string()),
         };
 
@@ -286,6 +298,7 @@ max_concurrent_tasks = 4
             heartbeat_interval_secs: 45,
             excluded_poll_check_interval_secs: 45,
             max_concurrent_tasks: 5,
+            max_reregisters: 3,
             data_dir: Some("/custom/data/dir".to_string()),
         };
 
@@ -309,6 +322,7 @@ max_concurrent_tasks = 4
             heartbeat_interval_secs: 30,
             excluded_poll_check_interval_secs: 30,
             max_concurrent_tasks: 2,
+            max_reregisters: 3,
             data_dir: None,
         };
 
@@ -330,6 +344,7 @@ max_concurrent_tasks = 4
             heartbeat_interval_secs: 30,
             excluded_poll_check_interval_secs: 30,
             max_concurrent_tasks: 2,
+            max_reregisters: 3,
             data_dir: None,
         };
 
@@ -348,6 +363,7 @@ max_concurrent_tasks = 4
             heartbeat_interval_secs: 30,
             excluded_poll_check_interval_secs: 30,
             max_concurrent_tasks: 2,
+            max_reregisters: 3,
             data_dir: None,
         };
 
@@ -366,6 +382,7 @@ max_concurrent_tasks = 4
             heartbeat_interval_secs: 30,
             excluded_poll_check_interval_secs: 30,
             max_concurrent_tasks: 2,
+            max_reregisters: 3,
             data_dir: None,
         };
 
@@ -387,6 +404,7 @@ max_concurrent_tasks = 4
             heartbeat_interval_secs: 30,
             excluded_poll_check_interval_secs: 30,
             max_concurrent_tasks: 2,
+            max_reregisters: 3,
             data_dir: None,
         };
 
@@ -403,6 +421,7 @@ max_concurrent_tasks = 4
             heartbeat_interval_secs: 30,
             excluded_poll_check_interval_secs: 30,
             max_concurrent_tasks: 2,
+            max_reregisters: 3,
             data_dir: None,
         };
 
@@ -423,6 +442,7 @@ max_concurrent_tasks = 4
             heartbeat_interval_secs: 30,
             excluded_poll_check_interval_secs: 30,
             max_concurrent_tasks: 2,
+            max_reregisters: 3,
             data_dir: Some("/custom/path/to/data".to_string()),
         };
 

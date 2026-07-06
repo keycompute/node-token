@@ -58,10 +58,6 @@ hostname = "0.4"
 # 重试策略
 tokio-retry = "0.3"
 
-# 文件权限（Unix）
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.27", features = ["fs"] }
-
 # 测试依赖
 [dev-dependencies]
 tempfile = "3"
