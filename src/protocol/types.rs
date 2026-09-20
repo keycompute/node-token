@@ -3,6 +3,7 @@
 //! 从 keycompute-types 复制的协议类型，node-token 作为独立项目不依赖 workspace。
 //! 本协议版本固定为 `node.v1`，所有公开 JSON 字段使用 `snake_case`。
 
+use super::node_capability::NativeModelProfile;
 use super::node_native::{NodeNativeHttpResult, NodeNativeOperation, NodeNativeRequest};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -43,6 +44,18 @@ pub struct NodeCapabilities {
     pub native_operations: Vec<NodeNativeOperation>,
     /// 支持的模型列表
     pub models: Vec<NodeModelCapability>,
+    #[serde(default)]
+    pub native_profiles: Vec<NativeModelProfile>,
+    #[serde(default)]
+    pub runtime_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeCapabilitiesRequest {
+    pub protocol_version: String,
+    pub node_id: NodeId,
+    pub session_id: NodeSessionId,
+    pub capabilities: NodeCapabilities,
 }
 
 // ============================================================================
@@ -728,6 +741,8 @@ mod tests {
                     model: "llama3".to_string(),
                 },
             ],
+            native_profiles: vec![],
+            runtime_version: None,
         };
         let json = serde_json::to_string(&caps).unwrap();
 
@@ -772,6 +787,8 @@ mod tests {
                 models: vec![NodeModelCapability {
                     model: "deepseek-chat".to_string(),
                 }],
+                native_profiles: vec![],
+                runtime_version: None,
             },
         };
         let json = serde_json::to_string(&req).unwrap();

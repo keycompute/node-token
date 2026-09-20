@@ -21,6 +21,8 @@ fn create_register_request() -> NodeRegisterRequest {
         capabilities: NodeCapabilities {
             runtime: "ollama".to_string(),
             native_operations: vec![],
+            native_profiles: vec![],
+            runtime_version: None,
             models: vec![
                 NodeModelCapability {
                     model: "deepseek-chat:latest".to_string(),

@@ -112,6 +112,8 @@ async fn test_full_node_lifecycle() {
             models: vec![node_token::protocol::types::NodeModelCapability {
                 model: "deepseek-chat:latest".to_string(),
             }],
+            native_profiles: vec![],
+            runtime_version: None,
         },
         poll_timeout_secs: 10,
     };

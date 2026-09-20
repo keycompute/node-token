@@ -34,6 +34,8 @@ fn test_session_lifecycle() {
                     model: "llama3:latest".to_string(),
                 },
             ],
+            native_profiles: vec![],
+            runtime_version: None,
         },
         poll_timeout_secs: 10,
     };
@@ -71,6 +73,8 @@ fn test_session_overwrite() {
             runtime: "ollama".to_string(),
             native_operations: vec![],
             models: vec![],
+            native_profiles: vec![],
+            runtime_version: None,
         },
         poll_timeout_secs: 10,
     };
@@ -87,6 +91,8 @@ fn test_session_overwrite() {
             models: vec![NodeModelCapability {
                 model: "new-model:latest".to_string(),
             }],
+            native_profiles: vec![],
+            runtime_version: None,
         },
         poll_timeout_secs: 20,
     };

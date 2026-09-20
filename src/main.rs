@@ -13,8 +13,8 @@ use node_token::NodeTokenConfig;
 use node_token::client::{KeyComputeClient, OllamaClient};
 use node_token::load_config;
 use node_token::runtime::{
-    HeartbeatContext, PollLoopConfig, TaskExecutor, heartbeat_loop, poll_loop, register_node,
-    try_load_session,
+    HeartbeatContext, PollLoopConfig, TaskExecutor, heartbeat_loop, poll_loop,
+    refresh_existing_session, register_node, try_load_session,
 };
 use node_token::storage::LocalStorage;
 
@@ -63,7 +63,12 @@ async fn main() -> Result<()> {
         let session = match try_load_session(&storage)? {
             Some(s) => {
                 info!("Loaded existing session, skipping registration");
-                s
+                client.set_session_token(s.session_token.clone()).await;
+                match refresh_existing_session(&client, &ollama_client, &storage, s.clone()).await {
+                    Ok(updated) => updated,
+                    Err(e) if e.is_session_invalid() => s,
+                    Err(e) => return Err(e.into()),
+                }
             }
             None => {
                 info!("Registering new node");

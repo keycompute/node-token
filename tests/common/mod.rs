@@ -53,6 +53,8 @@ pub fn create_register_request(client_instance_id: Option<&str>) -> NodeRegister
                     model: "llama3:latest".to_string(),
                 },
             ],
+            native_profiles: vec![],
+            runtime_version: None,
         },
     }
 }

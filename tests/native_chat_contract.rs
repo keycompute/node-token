@@ -1,7 +1,11 @@
 //! Native fidelity and single-attempt transport regressions; loopback mocks only.
 use node_token::{
     client::{api::KeyComputeClient, ollama::OllamaClient},
-    protocol::{node_native::*, types::*},
+    protocol::{
+        node_capability::{NativeFeature, NativeModelProfile},
+        node_native::*,
+        types::*,
+    },
     runtime::executor::TaskExecutor,
     storage::SessionData,
 };
@@ -154,6 +158,11 @@ async fn completion_retry_reuploads_the_same_result_without_new_inference() {
                 model: "node:literal".into(),
             }],
             native_operations: vec![NodeNativeOperation::Chat],
+            native_profiles: vec![
+                NativeModelProfile::plain_chat("node:literal")
+                    .with_features(vec![NativeFeature::Tools, NativeFeature::Vision]),
+            ],
+            runtime_version: Some("test".into()),
         },
         poll_timeout_secs: 1,
     };

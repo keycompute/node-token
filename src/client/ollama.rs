@@ -3,6 +3,7 @@
 //! 负责与本地 Ollama 实例通信，包括模型列表查询和 chat 调用。
 
 use crate::error::{NodeTokenError, OllamaResult};
+use crate::protocol::node_capability::{NativeFeature, NativeModelProfile};
 use crate::protocol::node_native::{
     MAX_NATIVE_BODY_BYTES, NodeNativeHttpResult, NodeNativeRequest, native_response_header_allowed,
 };
@@ -13,9 +14,27 @@ use crate::protocol::types::{
     ChatCompletionRequest, ChatCompletionResponse, ChoiceMessage, CompletionChoice, ContentPart,
     ImageUrl, MessageContent, Usage,
 };
+use futures_util::StreamExt;
 use reqwest::Client;
 use std::net::IpAddr;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
+
+fn valid_runtime_version(version: &str) -> bool {
+    if version.len() > 64 {
+        return false;
+    }
+    let core = version
+        .trim_start_matches('v')
+        .split('-')
+        .next()
+        .unwrap_or_default();
+    let parts: Vec<_> = core.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.parse::<u32>().is_ok())
+}
 
 /// 图片下载的最大字节数（20MB）
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
@@ -183,6 +202,23 @@ pub struct OllamaClient {
     pub(crate) native_client: Client,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OllamaNativeDiscovery {
+    pub runtime_version: Option<String>,
+    pub profiles: Vec<NativeModelProfile>,
+}
+
+/// Parse Ollama's runtime version without imposing an unsupported minimum.
+pub fn parse_runtime_version(value: &str) -> Option<(u64, u64, u64)> {
+    let raw = value.strip_prefix('v').unwrap_or(value);
+    let mut parts = raw.split(['.', '-']);
+    Some((
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    ))
+}
+
 impl OllamaClient {
     /// 创建新的 Ollama 客户端
     pub fn new(base_url: impl Into<String>) -> Self {
@@ -201,6 +237,7 @@ impl OllamaClient {
             .expect("Failed to create image download HTTP client");
         let native_client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("Failed to create native HTTP client");
 
@@ -210,6 +247,117 @@ impl OllamaClient {
             download_client,
             native_client,
         }
+    }
+
+    /// Discover advertised, non-inference capabilities from Ollama metadata.
+    /// Unknown or incomplete metadata is deliberately treated as legacy-only.
+    async fn native_metadata(
+        &self,
+        path: &'static str,
+        model: Option<&str>,
+    ) -> OllamaResult<serde_json::Value> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+            let request = if let Some(model) = model {
+                self.native_client
+                    .post(url)
+                    .json(&serde_json::json!({"model":model}))
+            } else {
+                self.native_client.get(url)
+            };
+            let response = request
+                .send()
+                .await
+                .map_err(|_| NodeTokenError::Ollama("native_metadata_unavailable".into()))?;
+            if !response.status().is_success() {
+                return Err(NodeTokenError::Ollama("native_metadata_unavailable".into()));
+            }
+            if response
+                .content_length()
+                .is_some_and(|size| size > 1024 * 1024)
+            {
+                return Err(NodeTokenError::Protocol("native_metadata_too_large".into()));
+            }
+            let mut chunks = response.bytes_stream();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk
+                    .map_err(|_| NodeTokenError::Ollama("native_metadata_unavailable".into()))?;
+                if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+                    return Err(NodeTokenError::Protocol("native_metadata_too_large".into()));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            serde_json::from_slice(&bytes)
+                .map_err(|_| NodeTokenError::Protocol("native_metadata_invalid".into()))
+        })
+        .await
+        .map_err(|_| NodeTokenError::Ollama("native_metadata_timeout".into()))?
+    }
+
+    /// Metadata-only capability discovery. Never performs a generation probe.
+    pub async fn discover_native_capabilities(
+        &self,
+        models: &[String],
+    ) -> OllamaResult<OllamaNativeDiscovery> {
+        if models.len() > 256 {
+            return Err(NodeTokenError::Protocol("native_model_limit".into()));
+        }
+        let version = self
+            .native_metadata("/api/version", None)
+            .await
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        let runtime_version = version.filter(|version| valid_runtime_version(version));
+        if runtime_version.is_none() {
+            return Ok(OllamaNativeDiscovery {
+                runtime_version: None,
+                profiles: vec![],
+            });
+        }
+        let mut requests = futures_util::stream::iter(models.iter().map(|model| async move {
+            let value = self.native_metadata("/api/show", Some(model)).await.ok()?;
+            let caps = value.get("capabilities")?.as_array()?;
+            let names: Vec<&str> = caps.iter().filter_map(serde_json::Value::as_str).collect();
+            if !names.contains(&"completion") {
+                return None;
+            }
+            let mut profile = NativeModelProfile::plain_chat(model.clone());
+            if names.contains(&"tools") {
+                profile.features.push(NativeFeature::Tools);
+            }
+            if names.contains(&"vision") {
+                profile.features.push(NativeFeature::Vision);
+            }
+            if names.contains(&"thinking") {
+                profile.features.push(NativeFeature::Thinking);
+            }
+            if names
+                .iter()
+                .any(|value| matches!(*value, "structured_output" | "json_schema"))
+            {
+                profile.features.push(NativeFeature::StructuredOutput);
+            }
+            Some(profile)
+        }))
+        .buffer_unordered(4);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut profiles = Vec::new();
+        while let Ok(Some(profile)) = tokio::time::timeout_at(deadline, requests.next()).await {
+            if let Some(profile) = profile {
+                profiles.push(profile);
+            }
+        }
+        profiles.sort_by(|a, b| a.model.cmp(&b.model));
+        Ok(OllamaNativeDiscovery {
+            runtime_version,
+            profiles,
+        })
     }
 
     /// Execute the phase1 native Chat operation, preserving the provider JSON verbatim.

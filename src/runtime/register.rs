@@ -40,7 +40,19 @@ pub async fn register_node(
     info!("Starting node registration...");
 
     // 1. 等待 Ollama 模型就绪（循环扫描，直到有模型或超时）
-    let models = wait_for_models_ready(ollama_client).await?;
+    let mut models = wait_for_models_ready(ollama_client).await?;
+    models.sort();
+    models.dedup();
+    let discovery = ollama_client
+        .discover_native_capabilities(&models)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("Native capability discovery unavailable: {}", e);
+            crate::client::OllamaNativeDiscovery {
+                runtime_version: None,
+                profiles: vec![],
+            }
+        });
 
     info!("Found {} Ollama models: {:?}", models.len(), models);
 
@@ -63,6 +75,8 @@ pub async fn register_node(
                 .into_iter()
                 .map(|m| NodeModelCapability { model: m })
                 .collect(),
+            native_profiles: discovery.profiles,
+            runtime_version: discovery.runtime_version,
         },
     };
 
@@ -128,6 +142,78 @@ pub fn try_load_session(storage: &LocalStorage) -> Result<Option<SessionData>> {
             Ok(None)
         }
     }
+}
+
+/// Refresh native metadata for an existing session; only explicit server negotiation
+/// changes the persisted session identity/capabilities.
+pub async fn refresh_existing_session(
+    client: &KeyComputeClient,
+    ollama_client: &OllamaClient,
+    storage: &LocalStorage,
+    mut session: SessionData,
+) -> Result<SessionData> {
+    let mut models = ollama_client.list_models().await?;
+    models.sort();
+    models.dedup();
+    let discovery = ollama_client
+        .discover_native_capabilities(&models)
+        .await
+        .map_err(|e| NodeTokenError::Ollama(e.to_string()))?;
+    let fresh = NodeCapabilities {
+        runtime: session.capabilities.runtime.clone(),
+        native_operations: vec![NodeNativeOperation::Chat],
+        models: models
+            .iter()
+            .cloned()
+            .map(|model| NodeModelCapability { model })
+            .collect(),
+        native_profiles: discovery.profiles,
+        runtime_version: discovery.runtime_version,
+    };
+    if serde_json::to_value(&fresh).ok() != serde_json::to_value(&session.capabilities).ok() {
+        let request = crate::protocol::types::NodeCapabilitiesRequest {
+            protocol_version: "node.v1".into(),
+            node_id: session.node_id,
+            session_id: session.session_id,
+            capabilities: fresh.clone(),
+        };
+        let mut attempts = 0;
+        let response = loop {
+            match client.update_capabilities(&request).await {
+                Ok(response) => break response,
+                Err(error)
+                    if attempts < 2
+                        && matches!(
+                            &error,
+                            NodeTokenError::Network(_)
+                                | NodeTokenError::HttpError {
+                                    status: 500..=599,
+                                    ..
+                                }
+                        ) =>
+                {
+                    attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(200 * attempts)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if response.node_id != session.node_id || response.session_token.is_empty() {
+            return Err(NodeTokenError::Protocol(
+                "capability_session_identity_mismatch".into(),
+            ));
+        }
+        session.node_id = response.node_id;
+        session.session_id = response.session_id;
+        session.session_token = response.session_token;
+        session.poll_timeout_secs = response.poll_timeout_secs;
+        session.capabilities = fresh;
+        storage.save_session(&session)?;
+        client
+            .set_session_token(session.session_token.clone())
+            .await;
+    }
+    Ok(session)
 }
 
 /// 等待 Ollama 模型就绪
@@ -219,6 +305,8 @@ mod tests {
                 models: vec![NodeModelCapability {
                     model: "test-model".to_string(),
                 }],
+                native_profiles: vec![],
+                runtime_version: None,
             },
             poll_timeout_secs: 30,
         };
@@ -270,6 +358,8 @@ mod tests {
                     .into_iter()
                     .map(|m| NodeModelCapability { model: m })
                     .collect(),
+                native_profiles: vec![],
+                runtime_version: None,
             },
         };
 
@@ -307,6 +397,8 @@ mod tests {
             models: vec![NodeModelCapability {
                 model: "deepseek-chat:latest".to_string(),
             }],
+            native_profiles: vec![],
+            runtime_version: None,
         };
 
         // 保存 session（模拟 register_node 中的持久化逻辑）
@@ -361,6 +453,8 @@ mod tests {
                     .into_iter()
                     .map(|m| NodeModelCapability { model: m })
                     .collect(),
+                native_profiles: vec![],
+                runtime_version: None,
             },
         };
 

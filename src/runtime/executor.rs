@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::client::{KeyComputeClient, OllamaClient};
 use crate::error::NodeTokenError;
+use crate::protocol::node_capability::NativeRequirements;
 use crate::protocol::node_native::NodeNativeHttpResult;
 use crate::protocol::types::{
     ChatCompletionResponse, ImageData, ImageGenerationResponse, NodeTaskCompleteRequest,
@@ -163,6 +164,24 @@ impl TaskExecutor {
         request
             .validate(&envelope.model)
             .map_err(|e| NodeTokenError::Protocol(e.to_string()))?;
+        let requirements = NativeRequirements::from_request(request)
+            .map_err(|e| NodeTokenError::UnsupportedCapability(e.to_string()))?;
+        let profile = self
+            .session
+            .capabilities
+            .native_profiles
+            .iter()
+            .find(|profile| {
+                profile.model == envelope.model && profile.operation == request.operation
+            })
+            .ok_or_else(|| {
+                NodeTokenError::UnsupportedCapability("native_model_profile_missing".into())
+            })?;
+        if !profile.permits(&requirements) {
+            return Err(NodeTokenError::UnsupportedCapability(
+                "native_request_capability_denied".into(),
+            ));
+        }
         let response = self
             .ollama_client
             .native_chat(request, envelope.deadline_unix_ms)
@@ -170,6 +189,9 @@ impl TaskExecutor {
         response
             .validate(&envelope.model)
             .map_err(|e| NodeTokenError::Protocol(e.to_string()))?;
+        profile
+            .validate_result(&response)
+            .map_err(|e| NodeTokenError::UnsupportedCapability(e.to_string()))?;
         Ok(response)
     }
 
@@ -509,6 +531,8 @@ mod tests {
                 runtime: "ollama".to_string(),
                 native_operations: vec![],
                 models: vec![],
+                native_profiles: vec![],
+                runtime_version: None,
             },
             poll_timeout_secs: 30,
         };

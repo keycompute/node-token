@@ -208,6 +208,8 @@ mod tests {
                         model: "llama3".to_string(),
                     },
                 ],
+                native_profiles: vec![],
+                runtime_version: None,
             },
             poll_timeout_secs: 30,
         }

@@ -15,4 +15,4 @@ pub mod register;
 pub use executor::TaskExecutor;
 pub use heartbeat::{HeartbeatContext, heartbeat_loop};
 pub use poll::{PollLoopConfig, poll_loop};
-pub use register::{register_node, try_load_session};
+pub use register::{refresh_existing_session, register_node, try_load_session};

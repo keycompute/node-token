@@ -4,11 +4,13 @@
 
 use crate::error::{NetworkResult, NodeTokenError};
 use crate::protocol::types::{
-    NodeHeartbeatRequest, NodeHeartbeatResponse, NodePollRequest, NodePollResponse,
-    NodeRegisterRequest, NodeRegisterResponse, NodeTaskCompleteRequest, NodeTaskCompleteResponse,
+    NodeCapabilitiesRequest, NodeHeartbeatRequest, NodeHeartbeatResponse, NodePollRequest,
+    NodePollResponse, NodeRegisterRequest, NodeRegisterResponse, NodeTaskCompleteRequest,
+    NodeTaskCompleteResponse,
 };
 use reqwest::Client;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
@@ -150,6 +152,34 @@ impl KeyComputeClient {
         Ok(response_body)
     }
 
+    /// Renegotiate capabilities for an existing authenticated session.
+    pub async fn update_capabilities(
+        &self,
+        request: &NodeCapabilitiesRequest,
+    ) -> NetworkResult<NodeRegisterResponse> {
+        let url = format!("{}/node/v1/capabilities", self.base_url);
+        let response = self
+            .http_client
+            .post(&url)
+            .timeout(Duration::from_secs(5))
+            .json(request)
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.require_session_token().await?),
+            )
+            .send()
+            .await
+            .map_err(NodeTokenError::Network)?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            return Err(NodeTokenError::HttpError {
+                status,
+                message: format!("Capabilities update failed: HTTP {status}"),
+            });
+        }
+        bounded_json(response, 64 * 1024).await
+    }
+
     pub async fn poll(&self, request: &NodePollRequest) -> NetworkResult<NodePollResponse> {
         let url = format!("{}/node/v1/tasks/poll", self.base_url);
         let response = self
@@ -269,6 +299,8 @@ mod tests {
                 models: vec![crate::protocol::types::NodeModelCapability {
                     model: "deepseek-chat".to_string(),
                 }],
+                native_profiles: vec![],
+                runtime_version: None,
             },
         };
         let response = client.register(&request).await.unwrap();
@@ -293,6 +325,8 @@ mod tests {
                 runtime: "ollama".to_string(),
                 native_operations: vec![],
                 models: vec![],
+                native_profiles: vec![],
+                runtime_version: None,
             },
         };
         assert!(client.register(&request).await.is_err());

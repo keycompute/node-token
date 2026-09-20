@@ -18,6 +18,8 @@ fn create_session_data() -> SessionData {
         capabilities: NodeCapabilities {
             runtime: "ollama".to_string(),
             native_operations: vec![],
+            native_profiles: vec![],
+            runtime_version: None,
             models: vec![
                 NodeModelCapability {
                     model: "deepseek-chat:latest".to_string(),
@@ -141,6 +143,8 @@ fn bench_large_session_save(c: &mut Criterion) {
         capabilities: NodeCapabilities {
             runtime: "ollama".to_string(),
             native_operations: vec![],
+            native_profiles: vec![],
+            runtime_version: None,
             models,
         },
         poll_timeout_secs: 30,
