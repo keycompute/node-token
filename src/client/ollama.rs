@@ -3,6 +3,9 @@
 //! 负责与本地 Ollama 实例通信，包括模型列表查询和 chat 调用。
 
 use crate::error::{NodeTokenError, OllamaResult};
+use crate::protocol::node_native::{
+    MAX_NATIVE_BODY_BYTES, NodeNativeHttpResult, NodeNativeRequest, native_response_header_allowed,
+};
 use crate::protocol::ollama::{
     OllamaChatRequest, OllamaChatResponse, OllamaMessage, OllamaModelListResponse,
 };
@@ -177,6 +180,7 @@ pub struct OllamaClient {
     pub(crate) http_client: Client,
     /// 图片下载专用 HTTP 客户端（禁止重定向、独立 User-Agent，复用连接池）
     pub(crate) download_client: Client,
+    pub(crate) native_client: Client,
 }
 
 impl OllamaClient {
@@ -195,12 +199,91 @@ impl OllamaClient {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("Failed to create image download HTTP client");
+        let native_client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("Failed to create native HTTP client");
 
         Self {
             base_url,
             http_client,
             download_client,
+            native_client,
         }
+    }
+
+    /// Execute the phase1 native Chat operation, preserving the provider JSON verbatim.
+    pub async fn native_chat(
+        &self,
+        request: &NodeNativeRequest,
+        deadline_unix_ms: i64,
+    ) -> OllamaResult<NodeNativeHttpResult> {
+        request
+            .validate(
+                request
+                    .body
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            )
+            .map_err(|e| NodeTokenError::Protocol(e.to_string()))?;
+        let url = format!(
+            "{}{}",
+            self.base_url.trim_end_matches('/'),
+            request.operation.local_path()
+        );
+        let remaining = deadline_unix_ms.saturating_sub(chrono::Utc::now().timestamp_millis());
+        if remaining <= 0 {
+            return Err(NodeTokenError::Ollama("native_deadline_expired".into()));
+        }
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(remaining as u64);
+        let response = tokio::time::timeout_at(
+            deadline,
+            self.native_client.post(url).json(&request.body).send(),
+        )
+        .await
+        .map_err(|_| NodeTokenError::Ollama("native_timeout".into()))?
+        .map_err(|_| NodeTokenError::Ollama("native_transport_error".into()))?;
+        if response
+            .content_length()
+            .is_some_and(|n| n > MAX_NATIVE_BODY_BYTES as u64)
+        {
+            return Err(NodeTokenError::Ollama("native_response_too_large".into()));
+        }
+        let status = response.status().as_u16();
+        let mut headers = Vec::new();
+        for (name, value) in response.headers() {
+            let name = name.as_str().to_ascii_lowercase();
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            if !native_response_header_allowed(&name, value) {
+                continue;
+            }
+            headers.push((name, value.to_string()));
+        }
+        let mut bytes = Vec::new();
+        use futures_util::StreamExt;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .map_err(|_| NodeTokenError::Ollama("native_timeout".into()))?
+        {
+            let chunk =
+                chunk.map_err(|_| NodeTokenError::Ollama("native_transport_error".into()))?;
+            if bytes.len().saturating_add(chunk.len()) > MAX_NATIVE_BODY_BYTES {
+                return Err(NodeTokenError::Ollama("native_response_too_large".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let body = serde_json::from_slice(&bytes)
+            .map_err(|_| NodeTokenError::Ollama("native_invalid_json".into()))?;
+        Ok(NodeNativeHttpResult {
+            status,
+            headers,
+            body,
+        })
     }
 
     /// 获取本地 Ollama 模型列表
@@ -549,9 +632,49 @@ pub(crate) fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::node_native::NodeNativeRequest;
     use crate::protocol::types::{Message, MessageRole};
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn native_chat_preserves_full_json_and_safe_response() {
+        let server = MockServer::start().await;
+        let request: NodeNativeRequest = serde_json::from_str(include_str!(
+            "../../tests/fixtures/node-native-chat-v1.json"
+        ))
+        .unwrap();
+        let response = serde_json::json!({
+            "model": "node:literal",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "reasoning": "kept", "tool_calls": [{"id": "call_1", "type": "function"}]}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+            "unknown": {"nested": true}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_json(&request.body))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .insert_header("authorization", "secret")
+                    .set_body_json(&response),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OllamaClient::new(server.uri());
+        let result = client
+            .native_chat(&request, chrono::Utc::now().timestamp_millis() + 5_000)
+            .await
+            .unwrap();
+        assert_eq!(result.body, response);
+        assert!(
+            result
+                .headers
+                .iter()
+                .all(|(name, _)| name != "authorization")
+        );
+    }
 
     #[test]
     fn test_client_creation() {

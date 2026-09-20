@@ -20,6 +20,7 @@ fn create_register_request() -> NodeRegisterRequest {
         registration_token: "test-token".to_string(),
         capabilities: NodeCapabilities {
             runtime: "ollama".to_string(),
+            native_operations: vec![],
             models: vec![
                 NodeModelCapability {
                     model: "deepseek-chat:latest".to_string(),
@@ -79,6 +80,7 @@ fn create_task_envelope() -> NodeTaskEnvelope {
         payload: NodeTaskPayload {
             request_id: Uuid::new_v4(),
             chat: Some(create_chat_request()),
+            native: None,
             image_generation: None,
             image_edit: None,
         },

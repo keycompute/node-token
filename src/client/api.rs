@@ -12,6 +12,31 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
+async fn bounded_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    limit: usize,
+) -> NetworkResult<T> {
+    if response.content_length().is_some_and(|n| n > limit as u64) {
+        return Err(NodeTokenError::Protocol(
+            "control_response_too_large".into(),
+        ));
+    }
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(NodeTokenError::Network)?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(NodeTokenError::Protocol(
+                "control_response_too_large".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body)
+        .map_err(|_| NodeTokenError::Protocol("control_response_invalid_json".into()))
+}
+
 /// KeyCompute API 客户端
 pub struct KeyComputeClient {
     /// 服务端基础 URL
@@ -140,14 +165,12 @@ impl KeyComputeClient {
             .map_err(NodeTokenError::Network)?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
             return Err(NodeTokenError::HttpError {
                 status,
-                message: format!("Poll failed: {}", body),
+                message: format!("Poll failed: HTTP {status}"),
             });
         }
-        let response_body: NodePollResponse =
-            response.json().await.map_err(NodeTokenError::Network)?;
+        let response_body: NodePollResponse = bounded_json(response, 64 * 1024 * 1024).await?;
         Ok(response_body)
     }
 
@@ -170,14 +193,12 @@ impl KeyComputeClient {
             .map_err(NodeTokenError::Network)?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
             return Err(NodeTokenError::HttpError {
                 status,
-                message: format!("Complete failed: {}", body),
+                message: format!("Complete failed: HTTP {status}"),
             });
         }
-        let response_body: NodeTaskCompleteResponse =
-            response.json().await.map_err(NodeTokenError::Network)?;
+        let response_body: NodeTaskCompleteResponse = bounded_json(response, 64 * 1024).await?;
         Ok(response_body)
     }
 
@@ -244,6 +265,7 @@ mod tests {
             registration_token: "test-token".to_string(),
             capabilities: crate::protocol::types::NodeCapabilities {
                 runtime: "ollama".to_string(),
+                native_operations: vec![],
                 models: vec![crate::protocol::types::NodeModelCapability {
                     model: "deepseek-chat".to_string(),
                 }],
@@ -269,6 +291,7 @@ mod tests {
             registration_token: "test-token".to_string(),
             capabilities: crate::protocol::types::NodeCapabilities {
                 runtime: "ollama".to_string(),
+                native_operations: vec![],
                 models: vec![],
             },
         };

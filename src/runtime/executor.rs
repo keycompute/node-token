@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::client::{KeyComputeClient, OllamaClient};
 use crate::error::NodeTokenError;
+use crate::protocol::node_native::NodeNativeHttpResult;
 use crate::protocol::types::{
     ChatCompletionResponse, ImageData, ImageGenerationResponse, NodeTaskCompleteRequest,
     NodeTaskCompleteResponse, NodeTaskEnvelope, NodeTaskResult,
@@ -100,7 +101,15 @@ impl TaskExecutor {
         }
 
         // 1. 根据任务类型路由
-        let result = if envelope.payload.is_chat() {
+        let result = if envelope.payload.is_native() {
+            match self.execute_native(&envelope).await {
+                Ok(response) => NodeTaskResult::NativeSucceeded { response },
+                Err(e) => {
+                    error!("Native task {} execution failed: {}", task_id, e);
+                    classify_ollama_error(&e)
+                }
+            }
+        } else if envelope.payload.is_chat() {
             match self.execute_chat(&envelope).await {
                 Ok(response) => {
                     info!("Chat task {} executed successfully", task_id);
@@ -145,6 +154,23 @@ impl TaskExecutor {
         // 2. 提交结果（带重试）
         self.complete_with_retry(task_id, lease_id, result, deadline_ms, grace_until_ms)
             .await;
+    }
+
+    async fn execute_native(&self, envelope: &NodeTaskEnvelope) -> Result<NodeNativeHttpResult> {
+        let request = envelope.payload.native.as_ref().ok_or_else(|| {
+            NodeTokenError::TaskExecution("Native request is missing".to_string())
+        })?;
+        request
+            .validate(&envelope.model)
+            .map_err(|e| NodeTokenError::Protocol(e.to_string()))?;
+        let response = self
+            .ollama_client
+            .native_chat(request, envelope.deadline_unix_ms)
+            .await?;
+        response
+            .validate(&envelope.model)
+            .map_err(|e| NodeTokenError::Protocol(e.to_string()))?;
+        Ok(response)
     }
 
     /// 执行 Chat 任务
@@ -481,6 +507,7 @@ mod tests {
             session_token: "test-token".to_string(),
             capabilities: NodeCapabilities {
                 runtime: "ollama".to_string(),
+                native_operations: vec![],
                 models: vec![],
             },
             poll_timeout_secs: 30,

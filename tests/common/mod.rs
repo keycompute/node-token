@@ -44,6 +44,7 @@ pub fn create_register_request(client_instance_id: Option<&str>) -> NodeRegister
         registration_token: "test-token".to_string(),
         capabilities: NodeCapabilities {
             runtime: "ollama".to_string(),
+            native_operations: vec![],
             models: vec![
                 NodeModelCapability {
                     model: "deepseek-chat:latest".to_string(),

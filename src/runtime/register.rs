@@ -7,6 +7,7 @@ use tracing::{debug, info};
 use crate::client::{KeyComputeClient, OllamaClient};
 use crate::config::NodeTokenConfig;
 use crate::error::NodeTokenError;
+use crate::protocol::node_native::NodeNativeOperation;
 use crate::protocol::types::{
     NodeCapabilities, NodeModelCapability, NodeRegisterRequest, NodeRegisterResponse,
 };
@@ -57,6 +58,7 @@ pub async fn register_node(
         registration_token: config.registration_token.clone(),
         capabilities: NodeCapabilities {
             runtime: "ollama".to_string(),
+            native_operations: vec![NodeNativeOperation::Chat],
             models: models
                 .into_iter()
                 .map(|m| NodeModelCapability { model: m })
@@ -213,6 +215,7 @@ mod tests {
             session_token: "test-token".to_string(),
             capabilities: NodeCapabilities {
                 runtime: "ollama".to_string(),
+                native_operations: vec![],
                 models: vec![NodeModelCapability {
                     model: "test-model".to_string(),
                 }],
@@ -262,6 +265,7 @@ mod tests {
             registration_token: config.registration_token.clone(),
             capabilities: NodeCapabilities {
                 runtime: "ollama".to_string(),
+                native_operations: vec![],
                 models: models
                     .into_iter()
                     .map(|m| NodeModelCapability { model: m })
@@ -299,6 +303,7 @@ mod tests {
         // 模拟注册请求中的 capabilities
         let capabilities = NodeCapabilities {
             runtime: "ollama".to_string(),
+            native_operations: vec![],
             models: vec![NodeModelCapability {
                 model: "deepseek-chat:latest".to_string(),
             }],
@@ -351,6 +356,7 @@ mod tests {
             registration_token: config.registration_token.clone(),
             capabilities: NodeCapabilities {
                 runtime: "ollama".to_string(),
+                native_operations: vec![],
                 models: models
                     .into_iter()
                     .map(|m| NodeModelCapability { model: m })

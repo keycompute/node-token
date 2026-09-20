@@ -108,6 +108,7 @@ async fn test_full_node_lifecycle() {
         session_token: session_token.clone(),
         capabilities: node_token::protocol::types::NodeCapabilities {
             runtime: "ollama".to_string(),
+            native_operations: vec![],
             models: vec![node_token::protocol::types::NodeModelCapability {
                 model: "deepseek-chat:latest".to_string(),
             }],

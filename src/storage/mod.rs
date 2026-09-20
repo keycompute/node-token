@@ -199,6 +199,7 @@ mod tests {
             session_token: "test-session-token-secret".to_string(),
             capabilities: NodeCapabilities {
                 runtime: "ollama".to_string(),
+                native_operations: vec![],
                 models: vec![
                     NodeModelCapability {
                         model: "deepseek-chat".to_string(),

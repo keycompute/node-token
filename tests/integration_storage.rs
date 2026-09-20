@@ -25,6 +25,7 @@ fn test_session_lifecycle() {
         session_token: "test-session-token".to_string(),
         capabilities: NodeCapabilities {
             runtime: "ollama".to_string(),
+            native_operations: vec![],
             models: vec![
                 NodeModelCapability {
                     model: "deepseek-chat:latest".to_string(),
@@ -68,6 +69,7 @@ fn test_session_overwrite() {
         session_token: "token-1".to_string(),
         capabilities: NodeCapabilities {
             runtime: "ollama".to_string(),
+            native_operations: vec![],
             models: vec![],
         },
         poll_timeout_secs: 10,
@@ -81,6 +83,7 @@ fn test_session_overwrite() {
         session_token: "token-2".to_string(),
         capabilities: NodeCapabilities {
             runtime: "ollama".to_string(),
+            native_operations: vec![],
             models: vec![NodeModelCapability {
                 model: "new-model:latest".to_string(),
             }],

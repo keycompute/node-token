@@ -3,6 +3,7 @@
 //! 从 keycompute-types 复制的协议类型，node-token 作为独立项目不依赖 workspace。
 //! 本协议版本固定为 `node.v1`，所有公开 JSON 字段使用 `snake_case`。
 
+use super::node_native::{NodeNativeHttpResult, NodeNativeOperation, NodeNativeRequest};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -38,6 +39,8 @@ pub struct NodeModelCapability {
 pub struct NodeCapabilities {
     /// 运行时类型（MVP 固定为 "ollama"）
     pub runtime: String,
+    #[serde(default)]
+    pub native_operations: Vec<NodeNativeOperation>,
     /// 支持的模型列表
     pub models: Vec<NodeModelCapability>,
 }
@@ -168,6 +171,8 @@ pub struct NodeTaskPayload {
     /// Chat 完成请求（可选，与图片生成/编辑互斥）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat: Option<ChatCompletionRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<NodeNativeRequest>,
     /// 图片生成请求（可选）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_generation: Option<ImageGenerationRequest>,
@@ -180,6 +185,10 @@ impl NodeTaskPayload {
     /// 是否为 Chat 任务
     pub fn is_chat(&self) -> bool {
         self.chat.is_some()
+    }
+
+    pub fn is_native(&self) -> bool {
+        self.native.is_some()
     }
 
     /// 是否为图片生成任务
@@ -195,6 +204,7 @@ impl NodeTaskPayload {
     /// 校验 payload 合法性：至多设置一种任务类型，且不能全部为空。
     pub fn validate(&self) -> Result<(), &'static str> {
         let count = self.chat.is_some() as u8
+            + self.native.is_some() as u8
             + self.image_generation.is_some() as u8
             + self.image_edit.is_some() as u8;
         if count > 1 {
@@ -236,6 +246,9 @@ pub enum NodeTaskResult {
     Succeeded {
         /// Chat 完成响应
         response: ChatCompletionResponse,
+    },
+    NativeSucceeded {
+        response: NodeNativeHttpResult,
     },
     /// 图片生成/编辑任务成功
     ImageSucceeded {
@@ -706,6 +719,7 @@ mod tests {
     fn test_node_capabilities_serialize() {
         let caps = NodeCapabilities {
             runtime: "ollama".to_string(),
+            native_operations: vec![],
             models: vec![
                 NodeModelCapability {
                     model: "deepseek-chat".to_string(),
@@ -754,6 +768,7 @@ mod tests {
             registration_token: "secret-token".to_string(),
             capabilities: NodeCapabilities {
                 runtime: "ollama".to_string(),
+                native_operations: vec![],
                 models: vec![NodeModelCapability {
                     model: "deepseek-chat".to_string(),
                 }],
@@ -973,7 +988,9 @@ mod tests {
                 );
             }
             NodeTaskResult::ImageSucceeded { .. } => panic!("Expected Succeeded variant"),
-            NodeTaskResult::Failed { .. } => panic!("Expected Succeeded variant"),
+            NodeTaskResult::Failed { .. } | NodeTaskResult::NativeSucceeded { .. } => {
+                panic!("Expected Succeeded variant")
+            }
         }
     }
 
@@ -1012,7 +1029,9 @@ mod tests {
                 assert!(!is_client_error);
             }
             NodeTaskResult::Succeeded { .. } => panic!("Expected Failed variant"),
-            NodeTaskResult::ImageSucceeded { .. } => panic!("Expected Failed variant"),
+            NodeTaskResult::ImageSucceeded { .. } | NodeTaskResult::NativeSucceeded { .. } => {
+                panic!("Expected Failed variant")
+            }
         }
     }
 

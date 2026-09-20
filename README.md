@@ -252,3 +252,6 @@ If this project helps you, feel free to give it a ⭐️ star.
 **[Quick Start](#quick-start)** • **[Report Issues](https://github.com/keycompute/node-token/issues)** • **[Latest Releases](https://github.com/keycompute/node-token/releases)**
 
 </div>
+# Native Chat protocol (phase 1)
+
+The node advertises `node.native.v1` Chat support for the configured Ollama origin at `/v1/chat/completions`. Phase 1 is non-streaming only (`stream: true` is rejected), accepts no caller headers, preserves the complete JSON request and response, and bounds each body to 1 MiB. Only an explicit safe response-header allowlist is returned. Messages, Responses, streaming events, and stateful features require a later server/client upgrade and are not advertised.

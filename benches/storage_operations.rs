@@ -17,6 +17,7 @@ fn create_session_data() -> SessionData {
         session_token: "test-session-token-abc123xyz".to_string(),
         capabilities: NodeCapabilities {
             runtime: "ollama".to_string(),
+            native_operations: vec![],
             models: vec![
                 NodeModelCapability {
                     model: "deepseek-chat:latest".to_string(),
@@ -139,6 +140,7 @@ fn bench_large_session_save(c: &mut Criterion) {
         session_token: "large-session-token-xyz789".to_string(),
         capabilities: NodeCapabilities {
             runtime: "ollama".to_string(),
+            native_operations: vec![],
             models,
         },
         poll_timeout_secs: 30,
