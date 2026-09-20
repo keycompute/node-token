@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Utc;
+use futures_util::StreamExt;
+use std::time::Duration;
 use tokio_retry::Retry;
 use tokio_retry::strategy::ExponentialBackoff;
 use tracing::{debug, error, info, warn};
@@ -15,9 +17,13 @@ use crate::client::{KeyComputeClient, OllamaClient};
 use crate::error::NodeTokenError;
 use crate::protocol::node_capability::NativeRequirements;
 use crate::protocol::node_native::NodeNativeHttpResult;
+use crate::protocol::node_stream::{
+    BoundedSseDecoder, NativeStreamInspector, NativeStreamProtocol,
+};
 use crate::protocol::types::{
-    ChatCompletionResponse, ImageData, ImageGenerationResponse, NodeTaskCompleteRequest,
-    NodeTaskCompleteResponse, NodeTaskEnvelope, NodeTaskResult,
+    ChatCompletionResponse, ImageData, ImageGenerationResponse, NodeNativeStreamEvent,
+    NodeTaskCompleteRequest, NodeTaskCompleteResponse, NodeTaskEnvelope, NodeTaskResult,
+    NodeTaskStreamEventRequest,
 };
 use crate::storage::SessionData;
 
@@ -103,8 +109,28 @@ impl TaskExecutor {
 
         // 1. 根据任务类型路由
         let result = if envelope.payload.is_native() {
-            match self.execute_native(&envelope).await {
-                Ok(response) => NodeTaskResult::NativeSucceeded { response },
+            let streaming = envelope
+                .payload
+                .native
+                .as_ref()
+                .and_then(|request| request.body.get("stream"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            let native_result = if streaming {
+                self.execute_task_with_events(
+                    &envelope,
+                    self.client.as_ref(),
+                    self.session.node_id,
+                    self.session.session_id,
+                )
+                .await
+            } else {
+                self.execute_native(&envelope)
+                    .await
+                    .map(|response| NodeTaskResult::NativeSucceeded { response })
+            };
+            match native_result {
+                Ok(result) => result,
                 Err(e) => {
                     error!("Native task {} execution failed: {}", task_id, e);
                     classify_ollama_error(&e)
@@ -155,6 +181,388 @@ impl TaskExecutor {
         // 2. 提交结果（带重试）
         self.complete_with_retry(task_id, lease_id, result, deadline_ms, grace_until_ms)
             .await;
+    }
+
+    /// Execute a streaming native task and deliver the same immutable event
+    /// envelope until the server acknowledges it.  This is deliberately
+    /// separate from task acquisition and from legacy task completion.
+    pub async fn execute_task_with_events(
+        &self,
+        task: &NodeTaskEnvelope,
+        client: &KeyComputeClient,
+        node_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+    ) -> Result<NodeTaskResult> {
+        let request = task.payload.native.as_ref().ok_or_else(|| {
+            NodeTokenError::TaskExecution("Native request is missing".to_string())
+        })?;
+        request
+            .validate_for(request.operation, &task.model)
+            .map_err(|e| NodeTokenError::Protocol(e.to_string()))?;
+        let requirements = NativeRequirements::from_request(request)
+            .map_err(|e| NodeTokenError::UnsupportedCapability(e.to_string()))?;
+        let profile = self
+            .session
+            .capabilities
+            .native_profiles
+            .iter()
+            .find(|profile| profile.model == task.model && profile.operation == request.operation)
+            .ok_or_else(|| {
+                NodeTokenError::UnsupportedCapability("native_model_profile_missing".into())
+            })?;
+        if !profile.permits(&requirements)
+            || !requirements
+                .features
+                .contains(&crate::protocol::node_capability::NativeFeature::Sse)
+        {
+            return Err(NodeTokenError::UnsupportedCapability(
+                "native_stream_capability_denied".into(),
+            ));
+        }
+        let protocol = match request.operation {
+            crate::protocol::node_native::NodeNativeOperation::Chat => NativeStreamProtocol::Chat,
+            crate::protocol::node_native::NodeNativeOperation::Messages => {
+                NativeStreamProtocol::Messages
+            }
+            crate::protocol::node_native::NodeNativeOperation::Responses => {
+                NativeStreamProtocol::Responses
+            }
+        };
+        let opened = self
+            .ollama_client
+            .native_operation_stream(request, task.deadline_unix_ms)
+            .await?;
+        let (status, headers, mut body) = match opened {
+            crate::client::ollama::NativeStreamResponse::Json(response) => {
+                response
+                    .validate_for(request.operation, &task.model)
+                    .map_err(|e| NodeTokenError::Protocol(e.to_string()))?;
+                profile
+                    .validate_result(&response)
+                    .map_err(|e| NodeTokenError::UnsupportedCapability(e.to_string()))?;
+                return Ok(NodeTaskResult::NativeSucceeded { response });
+            }
+            crate::client::ollama::NativeStreamResponse::Stream {
+                status,
+                headers,
+                response,
+            } => (status, headers, response.bytes_stream()),
+        };
+
+        let mut seq = 0u64;
+        Self::send_stream_event(
+            client,
+            node_id,
+            session_id,
+            task,
+            &mut seq,
+            NodeNativeStreamEvent::Start {
+                status,
+                headers: headers.clone(),
+                body: None,
+            },
+        )
+        .await?;
+
+        let mut decoder = BoundedSseDecoder::default();
+        let mut inspector = NativeStreamInspector::new(protocol);
+        let mut stream_bytes = 0usize;
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(
+                task.deadline_unix_ms
+                    .saturating_sub(Utc::now().timestamp_millis())
+                    .max(0) as u64,
+            );
+        loop {
+            let next = match tokio::time::timeout_at(
+                std::cmp::min(
+                    deadline,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+                ),
+                body.next(),
+            )
+            .await
+            {
+                Ok(next) => next,
+                Err(_) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        let usage = inspector.summary(status, headers.clone()).usage;
+                        Self::send_stream_event(
+                            client,
+                            node_id,
+                            session_id,
+                            task,
+                            &mut seq,
+                            NodeNativeStreamEvent::Failed {
+                                code: "native_timeout".into(),
+                                message: "native stream deadline expired".into(),
+                                usage,
+                            },
+                        )
+                        .await?;
+                        return Ok(NodeTaskResult::Failed {
+                            code: "native_timeout".into(),
+                            message: "native stream deadline expired".into(),
+                            is_client_error: false,
+                        });
+                    }
+                    Self::send_stream_event(
+                        client,
+                        node_id,
+                        session_id,
+                        task,
+                        &mut seq,
+                        NodeNativeStreamEvent::Data {
+                            frame: ": heartbeat\n\n".into(),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+            let Some(chunk) = next else { break };
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(_) => {
+                    let usage = inspector.summary(status, headers.clone()).usage;
+                    Self::send_stream_event(
+                        client,
+                        node_id,
+                        session_id,
+                        task,
+                        &mut seq,
+                        NodeNativeStreamEvent::Failed {
+                            code: "native_transport_error".into(),
+                            message: "native stream transport failed".into(),
+                            usage,
+                        },
+                    )
+                    .await?;
+                    return Ok(NodeTaskResult::Failed {
+                        code: "native_transport_error".into(),
+                        message: "native stream transport failed".into(),
+                        is_client_error: false,
+                    });
+                }
+            };
+            stream_bytes = stream_bytes.saturating_add(chunk.len());
+            if stream_bytes > profile.max_response_bytes as usize {
+                let usage = inspector.summary(status, headers.clone()).usage;
+                Self::send_stream_event(
+                    client,
+                    node_id,
+                    session_id,
+                    task,
+                    &mut seq,
+                    NodeNativeStreamEvent::Failed {
+                        code: "native_response_profile_limit".into(),
+                        message: "native stream exceeded profile response limit".into(),
+                        usage,
+                    },
+                )
+                .await?;
+                return Ok(NodeTaskResult::Failed {
+                    code: "native_response_profile_limit".into(),
+                    message: "native stream exceeded profile response limit".into(),
+                    is_client_error: true,
+                });
+            }
+            let frames = match decoder.push(&chunk) {
+                Ok(frames) => frames,
+                Err(error) => {
+                    let usage = inspector.summary(status, headers.clone()).usage;
+                    Self::send_stream_event(
+                        client,
+                        node_id,
+                        session_id,
+                        task,
+                        &mut seq,
+                        NodeNativeStreamEvent::Failed {
+                            code: format!("native_sse_{error:?}"),
+                            message: "native SSE decoding failed".into(),
+                            usage,
+                        },
+                    )
+                    .await?;
+                    return Ok(NodeTaskResult::Failed {
+                        code: format!("native_sse_{error:?}"),
+                        message: "native SSE decoding failed".into(),
+                        is_client_error: true,
+                    });
+                }
+            };
+            for frame in frames {
+                inspector.observe_for_model(&frame, Some(&task.model));
+                Self::send_stream_event(
+                    client,
+                    node_id,
+                    session_id,
+                    task,
+                    &mut seq,
+                    NodeNativeStreamEvent::Data { frame: frame.raw },
+                )
+                .await?;
+                // A protocol terminal is complete once its raw frame has been
+                // acknowledged.  Do not wait for EOF: upstreams are allowed
+                // to keep the TCP connection open after [DONE]/terminal.
+                if inspector.is_terminal() {
+                    return Self::send_inspector_outcome(
+                        client, node_id, session_id, task, &mut seq, &inspector, status, &headers,
+                    )
+                    .await;
+                }
+            }
+        }
+        let final_frame = match decoder.finish() {
+            Ok(frame) => frame,
+            Err(error) => {
+                let usage = inspector.summary(status, headers.clone()).usage;
+                Self::send_stream_event(
+                    client,
+                    node_id,
+                    session_id,
+                    task,
+                    &mut seq,
+                    NodeNativeStreamEvent::Failed {
+                        code: format!("native_sse_{error:?}"),
+                        message: "native SSE ended with an incomplete frame".into(),
+                        usage,
+                    },
+                )
+                .await?;
+                return Ok(NodeTaskResult::Failed {
+                    code: format!("native_sse_{error:?}"),
+                    message: "native SSE ended with an incomplete frame".into(),
+                    is_client_error: true,
+                });
+            }
+        };
+        if let Some(frame) = final_frame {
+            inspector.observe_for_model(&frame, Some(&task.model));
+            Self::send_stream_event(
+                client,
+                node_id,
+                session_id,
+                task,
+                &mut seq,
+                NodeNativeStreamEvent::Data { frame: frame.raw },
+            )
+            .await?;
+            if inspector.is_terminal() {
+                return Self::send_inspector_outcome(
+                    client, node_id, session_id, task, &mut seq, &inspector, status, &headers,
+                )
+                .await;
+            }
+        }
+        let usage = inspector.summary(status, headers.clone()).usage;
+        let _ = Self::send_stream_event(
+            client,
+            node_id,
+            session_id,
+            task,
+            &mut seq,
+            NodeNativeStreamEvent::Failed {
+                code: "native_stream_incomplete".into(),
+                message: "upstream ended without a protocol terminal event".into(),
+                usage,
+            },
+        )
+        .await;
+        Ok(NodeTaskResult::Failed {
+            code: "native_stream_incomplete".into(),
+            message: "upstream ended without a protocol terminal event".into(),
+            is_client_error: false,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_inspector_outcome(
+        client: &KeyComputeClient,
+        node_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        task: &NodeTaskEnvelope,
+        seq: &mut u64,
+        inspector: &NativeStreamInspector,
+        status: u16,
+        headers: &[(String, String)],
+    ) -> Result<NodeTaskResult> {
+        let summary = inspector.summary(status, headers.to_vec());
+        if inspector.is_failed() {
+            Self::send_stream_event(
+                client,
+                node_id,
+                session_id,
+                task,
+                seq,
+                NodeNativeStreamEvent::Failed {
+                    code: "native_stream_failed".into(),
+                    message: "upstream reported a terminal failure".into(),
+                    usage: summary.usage.clone(),
+                },
+            )
+            .await?;
+            return Ok(NodeTaskResult::Failed {
+                code: "native_stream_failed".into(),
+                message: "upstream reported a terminal failure".into(),
+                is_client_error: false,
+            });
+        }
+        Self::send_stream_event(
+            client,
+            node_id,
+            session_id,
+            task,
+            seq,
+            NodeNativeStreamEvent::Terminal {
+                summary: summary.clone(),
+            },
+        )
+        .await?;
+        Ok(NodeTaskResult::NativeStreamSucceeded { summary })
+    }
+
+    async fn send_stream_event(
+        client: &KeyComputeClient,
+        node_id: uuid::Uuid,
+        session_id: uuid::Uuid,
+        task: &NodeTaskEnvelope,
+        seq: &mut u64,
+        event: NodeNativeStreamEvent,
+    ) -> Result<()> {
+        let request = NodeTaskStreamEventRequest {
+            protocol_version: "node.v1".to_string(),
+            node_id,
+            session_id,
+            task_id: task.task_id,
+            lease_id: task.lease_id,
+            seq: *seq,
+            event,
+        };
+        let is_final = matches!(
+            request.event,
+            NodeNativeStreamEvent::Terminal { .. } | NodeNativeStreamEvent::Failed { .. }
+        );
+        let deadline_ms = if is_final {
+            task.complete_grace_until_unix_ms
+        } else {
+            task.deadline_unix_ms
+        };
+        let remaining = deadline_ms.saturating_sub(Utc::now().timestamp_millis());
+        if remaining <= 0 {
+            return Err(NodeTokenError::TaskExecution(
+                "native_stream_deadline".into(),
+            ));
+        }
+        let ack = tokio::time::timeout(
+            Duration::from_millis(remaining as u64),
+            client.stream_event(task.task_id, &request),
+        )
+        .await
+        .map_err(|_| NodeTokenError::TaskExecution("native_stream_deadline".into()))??;
+        validate_stream_ack(&request, &ack)?;
+        *seq = ack.next_seq;
+        Ok(())
     }
 
     async fn execute_native(&self, envelope: &NodeTaskEnvelope) -> Result<NodeNativeHttpResult> {
@@ -466,6 +874,27 @@ impl TaskExecutor {
             );
         }
     }
+}
+
+fn validate_stream_ack(
+    request: &NodeTaskStreamEventRequest,
+    ack: &crate::protocol::types::NodeTaskStreamEventResponse,
+) -> Result<()> {
+    let final_event = matches!(
+        request.event,
+        NodeNativeStreamEvent::Terminal { .. } | NodeNativeStreamEvent::Failed { .. }
+    );
+    if ack.terminal && !final_event {
+        return Err(NodeTokenError::TaskExecution(
+            "native_stream_canceled".into(),
+        ));
+    }
+    if !ack.accepted || request.seq.checked_add(1) != Some(ack.next_seq) {
+        return Err(NodeTokenError::Protocol(
+            "native_stream_ack_sequence_mismatch".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// 检查 base64 字符串是否非空，空字符串返回 None
@@ -823,5 +1252,47 @@ mod tests {
 
         let after_grace = grace_until + Duration::seconds(1);
         assert!(after_grace > grace_until);
+    }
+}
+
+#[cfg(test)]
+mod stream_ack_tests {
+    use super::*;
+    use crate::protocol::types::NodeTaskStreamEventResponse;
+    #[test]
+    fn terminal_ack_is_success_only_for_the_submitted_terminal_event() {
+        let mut request = NodeTaskStreamEventRequest {
+            protocol_version: "node.v1".into(),
+            node_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            task_id: uuid::Uuid::new_v4(),
+            lease_id: uuid::Uuid::new_v4(),
+            seq: 3,
+            event: NodeNativeStreamEvent::Data {
+                frame: "data: x\n\n".into(),
+            },
+        };
+        let mut ack = NodeTaskStreamEventResponse {
+            accepted: true,
+            next_seq: 4,
+            retry_after_ms: None,
+            terminal: false,
+        };
+        validate_stream_ack(&request, &ack).unwrap();
+        ack.terminal = true;
+        assert!(
+            validate_stream_ack(&request, &ack).is_err(),
+            "terminal while sending data signals cancellation"
+        );
+        request.event=NodeNativeStreamEvent::Terminal {summary:serde_json::from_value(serde_json::json!({"protocol":"chat","status":200,"headers":[],"terminal_event":"data: [DONE]\n\n"})).unwrap()};
+        validate_stream_ack(&request, &ack).unwrap();
+        ack.next_seq = 99;
+        assert!(
+            validate_stream_ack(&request, &ack).is_err(),
+            "a skipped acknowledgement must never skip unsent events"
+        );
+        ack.next_seq = 4;
+        ack.accepted = false;
+        assert!(validate_stream_ack(&request, &ack).is_err());
     }
 }

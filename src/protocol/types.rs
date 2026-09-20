@@ -5,6 +5,7 @@
 
 use super::node_capability::NativeModelProfile;
 use super::node_native::{NodeNativeHttpResult, NodeNativeOperation, NodeNativeRequest};
+use super::node_stream::{NativeStreamUsage, NodeNativeStreamSummary};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -263,6 +264,9 @@ pub enum NodeTaskResult {
     NativeSucceeded {
         response: NodeNativeHttpResult,
     },
+    NativeStreamSucceeded {
+        summary: NodeNativeStreamSummary,
+    },
     /// 图片生成/编辑任务成功
     ImageSucceeded {
         /// 图片生成响应
@@ -279,6 +283,52 @@ pub enum NodeTaskResult {
         #[serde(default)]
         is_client_error: bool,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum NodeNativeStreamEvent {
+    Start {
+        status: u16,
+        #[serde(default)]
+        headers: Vec<(String, String)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<serde_json::Value>,
+    },
+    Data {
+        frame: String,
+    },
+    Terminal {
+        summary: NodeNativeStreamSummary,
+    },
+    Failed {
+        code: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<NativeStreamUsage>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeTaskStreamEventRequest {
+    pub protocol_version: String,
+    pub node_id: NodeId,
+    pub session_id: NodeSessionId,
+    pub task_id: NodeTaskId,
+    pub lease_id: NodeLeaseId,
+    pub seq: u64,
+    pub event: NodeNativeStreamEvent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeTaskStreamEventResponse {
+    pub accepted: bool,
+    pub next_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    #[serde(default)]
+    pub terminal: bool,
 }
 
 /// 节点任务完成响应
@@ -1005,7 +1055,9 @@ mod tests {
                 );
             }
             NodeTaskResult::ImageSucceeded { .. } => panic!("Expected Succeeded variant"),
-            NodeTaskResult::Failed { .. } | NodeTaskResult::NativeSucceeded { .. } => {
+            NodeTaskResult::Failed { .. }
+            | NodeTaskResult::NativeSucceeded { .. }
+            | NodeTaskResult::NativeStreamSucceeded { .. } => {
                 panic!("Expected Succeeded variant")
             }
         }
@@ -1046,7 +1098,9 @@ mod tests {
                 assert!(!is_client_error);
             }
             NodeTaskResult::Succeeded { .. } => panic!("Expected Failed variant"),
-            NodeTaskResult::ImageSucceeded { .. } | NodeTaskResult::NativeSucceeded { .. } => {
+            NodeTaskResult::ImageSucceeded { .. }
+            | NodeTaskResult::NativeSucceeded { .. }
+            | NodeTaskResult::NativeStreamSucceeded { .. } => {
                 panic!("Expected Failed variant")
             }
         }

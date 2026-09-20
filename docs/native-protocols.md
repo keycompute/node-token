@@ -15,8 +15,12 @@ Safe protocol headers are forwarded, but platform keys/cookies are never passed
 to Ollama. Bodies are bounded and redacted in diagnostic formatting. Retrying
 result delivery never repeats inference.
 
-Phase 3 supports non-streaming Chat, Messages and stateless Responses. Native
-streaming and platform Responses state are later stages, not silently emulated
-here. Known unsupported Ollama features are rejected rather than removed.
+Chat, Messages and stateless Responses support both native JSON and SSE.
+Streaming requires an explicit per-model/per-operation `sse` profile. Workers
+keep pulling tasks and upload bounded Start/Data/Terminal events with immutable
+session, lease and sequence identifiers. Event-delivery retries never repeat
+inference; cancellation and malformed terminals stop the local response stream.
+Platform-managed Responses state is a subsequent server feature, not an Ollama
+runtime capability. Known unsupported Ollama features are rejected rather than removed.
 Cross-repository fixtures under `tests/fixtures` verify compatibility with
 KeyCompute, including operation-specific usage and error response validation.

@@ -5,8 +5,8 @@
 use crate::error::{NodeTokenError, OllamaResult};
 use crate::protocol::node_capability::{NativeFeature, NativeModelProfile};
 use crate::protocol::node_native::{
-    MAX_NATIVE_BODY_BYTES, NodeNativeHttpResult, NodeNativeOperation, NodeNativeRequest,
-    native_response_header_allowed,
+    MAX_NATIVE_BODY_BYTES, MAX_NATIVE_HEADER_VALUE_BYTES, NodeNativeHttpResult,
+    NodeNativeOperation, NodeNativeRequest, native_response_header_allowed,
 };
 use crate::protocol::ollama::{
     OllamaChatRequest, OllamaChatResponse, OllamaMessage, OllamaModelListResponse,
@@ -47,6 +47,61 @@ fn phase3_runtime_eligible(version: &str) -> bool {
 
 /// 图片下载的最大字节数（20MB）
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+fn is_event_stream_content_type(value: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+fn safe_native_headers(
+    response: &reqwest::Response,
+    allow_event_stream: bool,
+) -> Vec<(String, String)> {
+    response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.as_str().to_ascii_lowercase();
+            let value = value.to_str().ok()?;
+            let allowed = native_response_header_allowed(&name, value)
+                || (allow_event_stream
+                    && name == "content-type"
+                    && value.len() <= MAX_NATIVE_HEADER_VALUE_BYTES
+                    && value.bytes().all(|byte| (32..127).contains(&byte))
+                    && is_event_stream_content_type(value));
+            allowed.then(|| (name, value.to_string()))
+        })
+        .collect()
+}
+
+async fn read_bounded_native_json(
+    response: reqwest::Response,
+    deadline: tokio::time::Instant,
+) -> OllamaResult<NodeNativeHttpResult> {
+    let status = response.status().as_u16();
+    let headers = safe_native_headers(&response, false);
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next())
+        .await
+        .map_err(|_| NodeTokenError::Ollama("native_timeout".into()))?
+    {
+        let chunk = chunk.map_err(|_| NodeTokenError::Ollama("native_transport_error".into()))?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_NATIVE_BODY_BYTES {
+            return Err(NodeTokenError::Ollama("native_response_too_large".into()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body = serde_json::from_slice(&bytes)
+        .map_err(|_| NodeTokenError::Ollama("native_invalid_json".into()))?;
+    Ok(NodeNativeHttpResult {
+        status,
+        headers,
+        body,
+    })
+}
 
 /// 从 MessageContent 中提取 base64 图片数据（剥离 data URI 前缀）
 ///
@@ -217,6 +272,17 @@ pub struct OllamaNativeDiscovery {
     pub profiles: Vec<NativeModelProfile>,
 }
 
+/// The status and safe headers are returned before the body stream is consumed.
+/// A non-success response is buffered only within the normal native JSON limit.
+pub(crate) enum NativeStreamResponse {
+    Json(NodeNativeHttpResult),
+    Stream {
+        status: u16,
+        headers: Vec<(String, String)>,
+        response: reqwest::Response,
+    },
+}
+
 /// Parse Ollama's runtime version without imposing an unsupported minimum.
 pub fn parse_runtime_version(value: &str) -> Option<(u64, u64, u64)> {
     let raw = value.strip_prefix('v').unwrap_or(value);
@@ -246,7 +312,10 @@ impl OllamaClient {
             .expect("Failed to create image download HTTP client");
         let native_client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(10))
+            // Native operations apply their own deadlines to headers and body
+            // reads. Keep the client-wide ceiling well beyond any task
+            // deadline so it cannot preempt a valid SSE heartbeat interval.
+            .timeout(Duration::from_secs(24 * 60 * 60))
             .build()
             .expect("Failed to create native HTTP client");
 
@@ -340,6 +409,9 @@ impl OllamaClient {
                 return None;
             }
             let mut features = Vec::new();
+            if multi_protocol {
+                features.push(NativeFeature::Sse);
+            }
             if names.contains(&"tools") {
                 features.push(NativeFeature::Tools);
             }
@@ -466,6 +538,70 @@ impl OllamaClient {
             status,
             headers,
             body,
+        })
+    }
+
+    /// Open one genuine native SSE request.  This method never changes the
+    /// caller's `stream` flag and never retries the inference request.
+    pub(crate) async fn native_operation_stream(
+        &self,
+        request: &NodeNativeRequest,
+        deadline_unix_ms: i64,
+    ) -> OllamaResult<NativeStreamResponse> {
+        let model = request
+            .body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        request
+            .validate_for(request.operation, model)
+            .map_err(|e| NodeTokenError::Protocol(e.to_string()))?;
+        if request
+            .body
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return Err(NodeTokenError::Protocol("native_stream_required".into()));
+        }
+        let remaining = deadline_unix_ms.saturating_sub(chrono::Utc::now().timestamp_millis());
+        if remaining <= 0 {
+            return Err(NodeTokenError::Ollama("native_deadline_expired".into()));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(remaining as u64);
+        let url = format!(
+            "{}{}",
+            self.base_url.trim_end_matches('/'),
+            request.operation.local_path()
+        );
+        let mut outgoing = self.native_client.post(url).json(&request.body);
+        for (name, value) in &request.headers {
+            outgoing = outgoing.header(name, value);
+        }
+        let response = tokio::time::timeout_at(deadline, outgoing.send())
+            .await
+            .map_err(|_| NodeTokenError::Ollama("native_timeout".into()))?
+            .map_err(|_| NodeTokenError::Ollama("native_transport_error".into()))?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            return read_bounded_native_json(response, deadline)
+                .await
+                .map(NativeStreamResponse::Json);
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        if !content_type.is_some_and(is_event_stream_content_type) {
+            return Err(NodeTokenError::Protocol(
+                "native_stream_content_type_required".into(),
+            ));
+        }
+        let headers = safe_native_headers(&response, true);
+        Ok(NativeStreamResponse::Stream {
+            status,
+            headers,
+            response,
         })
     }
 

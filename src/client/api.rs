@@ -6,7 +6,7 @@ use crate::error::{NetworkResult, NodeTokenError};
 use crate::protocol::types::{
     NodeCapabilitiesRequest, NodeHeartbeatRequest, NodeHeartbeatResponse, NodePollRequest,
     NodePollResponse, NodeRegisterRequest, NodeRegisterResponse, NodeTaskCompleteRequest,
-    NodeTaskCompleteResponse,
+    NodeTaskCompleteResponse, NodeTaskStreamEventRequest, NodeTaskStreamEventResponse,
 };
 use reqwest::Client;
 use std::sync::Arc;
@@ -230,6 +230,73 @@ impl KeyComputeClient {
         }
         let response_body: NodeTaskCompleteResponse = bounded_json(response, 64 * 1024).await?;
         Ok(response_body)
+    }
+
+    /// Deliver one immutable native-stream event.  The request (including its
+    /// lease and sequence) is reused for bounded retries; it is never rebuilt
+    /// from the current session state.
+    pub async fn stream_event(
+        &self,
+        task_id: uuid::Uuid,
+        request: &NodeTaskStreamEventRequest,
+    ) -> NetworkResult<NodeTaskStreamEventResponse> {
+        if task_id != request.task_id {
+            return Err(NodeTokenError::Protocol("stream_task_id_mismatch".into()));
+        }
+        let encoded = serde_json::to_vec(request)
+            .map_err(|_| NodeTokenError::Protocol("stream_event_encoding_failed".into()))?;
+        if encoded.len() > 2 * 1024 * 1024 {
+            return Err(NodeTokenError::Protocol("stream_event_too_large".into()));
+        }
+        let url = format!("{}/node/v1/tasks/{}/events", self.base_url, task_id);
+        // Freeze the lease's credential and serialized event across all delivery
+        // retries. A timeout after persistence must not cause a second inference.
+        let token = self.require_session_token().await?;
+        let mut delay = Duration::from_millis(50);
+        for attempt in 0..12 {
+            let received = self
+                .http_client
+                .post(&url)
+                .timeout(Duration::from_secs(3))
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(encoded.clone())
+                .send()
+                .await;
+            match received {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        let ack: NodeTaskStreamEventResponse =
+                            bounded_json(response, 16 * 1024).await?;
+                        if ack.accepted || ack.terminal || ack.retry_after_ms.is_none() {
+                            return Ok(ack);
+                        }
+                        if attempt == 11 {
+                            return Err(NodeTokenError::HttpError {
+                                status: 429,
+                                message: "stream event backpressure deadline".into(),
+                            });
+                        }
+                        delay =
+                            Duration::from_millis(ack.retry_after_ms.unwrap_or(50).clamp(10, 1000));
+                    } else if !(status.as_u16() == 429 || status.is_server_error()) || attempt == 11
+                    {
+                        // Control-plane error bodies are not protocol results;
+                        // do not buffer or expose arbitrary proxy HTML/secrets.
+                        return Err(NodeTokenError::HttpError {
+                            status: status.as_u16(),
+                            message: "native stream event delivery rejected".into(),
+                        });
+                    }
+                }
+                Err(error) if attempt == 11 => return Err(NodeTokenError::Network(error)),
+                Err(_) => {}
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(1));
+        }
+        unreachable!("bounded event delivery loop returns")
     }
 
     async fn require_session_token(&self) -> Result<String, NodeTokenError> {
@@ -473,5 +540,56 @@ mod tests {
             response.action,
             crate::protocol::types::NodeTaskCompleteAction::Succeeded
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_delivery_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+    struct FirstFailure(Arc<AtomicUsize>);
+    impl Respond for FirstFailure {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(503)
+            } else {
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"accepted":true,"next_seq":1,"terminal":false}),
+                )
+            }
+        }
+    }
+    #[tokio::test]
+    async fn retry_delivery_preserves_event_sequence_and_lease() {
+        let server = MockServer::start().await;
+        let id = uuid::Uuid::new_v4();
+        let count = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path(format!("/node/v1/tasks/{id}/events")))
+            .and(header("authorization", "Bearer test-session"))
+            .respond_with(FirstFailure(count.clone()))
+            .mount(&server)
+            .await;
+        let request = NodeTaskStreamEventRequest {
+            protocol_version: "node.v1".into(),
+            node_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            task_id: id,
+            lease_id: uuid::Uuid::new_v4(),
+            seq: 0,
+            event: crate::protocol::types::NodeNativeStreamEvent::Start {
+                status: 200,
+                headers: vec![("content-type".into(), "text/event-stream".into())],
+                body: None,
+            },
+        };
+        let client = KeyComputeClient::new_with_token(server.uri(), "test-session".into());
+        assert_eq!(client.stream_event(id, &request).await.unwrap().next_seq, 1);
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].body, received[1].body);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 }
