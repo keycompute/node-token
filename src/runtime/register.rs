@@ -2,6 +2,7 @@
 //!
 //! 负责扫描 Ollama 模型、构建注册请求、调用注册 API 并持久化 session。
 
+use std::collections::BTreeSet;
 use tracing::{debug, info};
 
 use crate::client::{KeyComputeClient, OllamaClient};
@@ -15,6 +16,17 @@ use crate::storage::{LocalStorage, SessionData};
 
 /// 结果类型别名
 pub type Result<T> = std::result::Result<T, NodeTokenError>;
+
+fn native_operations_from_profiles(
+    profiles: &[crate::protocol::node_capability::NativeModelProfile],
+) -> Vec<NodeNativeOperation> {
+    profiles
+        .iter()
+        .map(|profile| profile.operation)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
 
 /// 注册节点到 KeyCompute 服务端
 ///
@@ -70,7 +82,7 @@ pub async fn register_node(
         registration_token: config.registration_token.clone(),
         capabilities: NodeCapabilities {
             runtime: "ollama".to_string(),
-            native_operations: vec![NodeNativeOperation::Chat],
+            native_operations: native_operations_from_profiles(&discovery.profiles),
             models: models
                 .into_iter()
                 .map(|m| NodeModelCapability { model: m })
@@ -161,7 +173,7 @@ pub async fn refresh_existing_session(
         .map_err(|e| NodeTokenError::Ollama(e.to_string()))?;
     let fresh = NodeCapabilities {
         runtime: session.capabilities.runtime.clone(),
-        native_operations: vec![NodeNativeOperation::Chat],
+        native_operations: native_operations_from_profiles(&discovery.profiles),
         models: models
             .iter()
             .cloned()

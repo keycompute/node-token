@@ -5,7 +5,8 @@
 use crate::error::{NodeTokenError, OllamaResult};
 use crate::protocol::node_capability::{NativeFeature, NativeModelProfile};
 use crate::protocol::node_native::{
-    MAX_NATIVE_BODY_BYTES, NodeNativeHttpResult, NodeNativeRequest, native_response_header_allowed,
+    MAX_NATIVE_BODY_BYTES, NodeNativeHttpResult, NodeNativeOperation, NodeNativeRequest,
+    native_response_header_allowed,
 };
 use crate::protocol::ollama::{
     OllamaChatRequest, OllamaChatResponse, OllamaMessage, OllamaModelListResponse,
@@ -34,6 +35,14 @@ fn valid_runtime_version(version: &str) -> bool {
         && parts
             .iter()
             .all(|p| !p.is_empty() && p.parse::<u32>().is_ok())
+}
+
+/// Phase3 uses the documented non-streaming compatibility surface conservatively.
+/// 0.14.0 is the tested floor for advertising all three native operations.
+const PHASE3_MIN_OLLAMA_VERSION: (u64, u64, u64) = (0, 14, 0);
+
+fn phase3_runtime_eligible(version: &str) -> bool {
+    parse_runtime_version(version).is_some_and(|parsed| parsed >= PHASE3_MIN_OLLAMA_VERSION)
 }
 
 /// 图片下载的最大字节数（20MB）
@@ -316,10 +325,13 @@ impl OllamaClient {
         let runtime_version = version.filter(|version| valid_runtime_version(version));
         if runtime_version.is_none() {
             return Ok(OllamaNativeDiscovery {
-                runtime_version: None,
+                runtime_version,
                 profiles: vec![],
             });
         }
+        let multi_protocol = runtime_version
+            .as_deref()
+            .is_some_and(phase3_runtime_eligible);
         let mut requests = futures_util::stream::iter(models.iter().map(|model| async move {
             let value = self.native_metadata("/api/show", Some(model)).await.ok()?;
             let caps = value.get("capabilities")?.as_array()?;
@@ -327,33 +339,47 @@ impl OllamaClient {
             if !names.contains(&"completion") {
                 return None;
             }
-            let mut profile = NativeModelProfile::plain_chat(model.clone());
+            let mut features = Vec::new();
             if names.contains(&"tools") {
-                profile.features.push(NativeFeature::Tools);
+                features.push(NativeFeature::Tools);
             }
             if names.contains(&"vision") {
-                profile.features.push(NativeFeature::Vision);
+                features.push(NativeFeature::Vision);
             }
             if names.contains(&"thinking") {
-                profile.features.push(NativeFeature::Thinking);
+                features.push(NativeFeature::Thinking);
             }
             if names
                 .iter()
                 .any(|value| matches!(*value, "structured_output" | "json_schema"))
             {
-                profile.features.push(NativeFeature::StructuredOutput);
+                features.push(NativeFeature::StructuredOutput);
             }
-            Some(profile)
+            Some(
+                [
+                    NodeNativeOperation::Chat,
+                    NodeNativeOperation::Messages,
+                    NodeNativeOperation::Responses,
+                ]
+                .into_iter()
+                .filter(|operation| multi_protocol || *operation == NodeNativeOperation::Chat)
+                .map(|operation| {
+                    NativeModelProfile::for_operation(model.clone(), operation)
+                        .with_features(features.clone())
+                })
+                .collect::<Vec<_>>(),
+            )
         }))
         .buffer_unordered(4);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let mut profiles = Vec::new();
         while let Ok(Some(profile)) = tokio::time::timeout_at(deadline, requests.next()).await {
-            if let Some(profile) = profile {
-                profiles.push(profile);
+            if let Some(model_profiles) = profile {
+                profiles.extend(model_profiles);
             }
         }
-        profiles.sort_by(|a, b| a.model.cmp(&b.model));
+        profiles
+            .sort_by(|a, b| (a.model.as_str(), a.operation).cmp(&(b.model.as_str(), b.operation)));
         Ok(OllamaNativeDiscovery {
             runtime_version,
             profiles,
@@ -366,14 +392,22 @@ impl OllamaClient {
         request: &NodeNativeRequest,
         deadline_unix_ms: i64,
     ) -> OllamaResult<NodeNativeHttpResult> {
+        self.native_operation(request, deadline_unix_ms).await
+    }
+
+    /// Execute any fixed native operation against the configured local Ollama origin.
+    pub async fn native_operation(
+        &self,
+        request: &NodeNativeRequest,
+        deadline_unix_ms: i64,
+    ) -> OllamaResult<NodeNativeHttpResult> {
+        let model = request
+            .body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
         request
-            .validate(
-                request
-                    .body
-                    .get("model")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
-            )
+            .validate_for(request.operation, model)
             .map_err(|e| NodeTokenError::Protocol(e.to_string()))?;
         let url = format!(
             "{}{}",
@@ -386,13 +420,14 @@ impl OllamaClient {
         }
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_millis(remaining as u64);
-        let response = tokio::time::timeout_at(
-            deadline,
-            self.native_client.post(url).json(&request.body).send(),
-        )
-        .await
-        .map_err(|_| NodeTokenError::Ollama("native_timeout".into()))?
-        .map_err(|_| NodeTokenError::Ollama("native_transport_error".into()))?;
+        let mut outgoing = self.native_client.post(url).json(&request.body);
+        for (name, value) in &request.headers {
+            outgoing = outgoing.header(name, value);
+        }
+        let response = tokio::time::timeout_at(deadline, outgoing.send())
+            .await
+            .map_err(|_| NodeTokenError::Ollama("native_timeout".into()))?
+            .map_err(|_| NodeTokenError::Ollama("native_transport_error".into()))?;
         if response
             .content_length()
             .is_some_and(|n| n > MAX_NATIVE_BODY_BYTES as u64)

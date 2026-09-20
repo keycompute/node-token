@@ -183,3 +183,70 @@ async fn completion_retry_reuploads_the_same_result_without_new_inference() {
     assert_eq!(uploaded["result"]["response"]["body"], success());
     assert_eq!(counter.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn messages_and_responses_use_fixed_local_endpoints_without_projection() {
+    use wiremock::matchers::header;
+    for (operation, fixture) in [
+        (
+            NodeNativeOperation::Messages,
+            include_str!("fixtures/node-native-messages-v1.json"),
+        ),
+        (
+            NodeNativeOperation::Responses,
+            include_str!("fixtures/node-native-responses-v1.json"),
+        ),
+    ] {
+        let request: NodeNativeRequest = serde_json::from_str(fixture).unwrap();
+        let model = request.body["model"].as_str().unwrap();
+        let success = if operation == NodeNativeOperation::Messages {
+            json!({"id":"msg-tools","model":model,"type":"message","role":"assistant","content":[{"type":"tool_use","id":"call1","name":"f","input":{"x":1}}],"stop_reason":"tool_use","usage":{"input_tokens":4,"output_tokens":3},"extension":{"untouched":[null,1]}})
+        } else {
+            json!({"id":"resp-tools","model":model,"object":"response","status":"completed","output":[{"type":"function_call","call_id":"call1","name":"f","arguments":"{\"x\":1}"}],"usage":{"input_tokens":4,"output_tokens":3,"total_tokens":7},"extension":{"untouched":[null,1]}})
+        };
+        for status in [200, 400, 429, 500] {
+            let server = MockServer::start().await;
+            let body = if status == 200 {
+                success.clone()
+            } else {
+                json!({"error":{"code":"isolated","message":"Original rejection","extra":[null,1]}})
+            };
+            let mut mock = Mock::given(method("POST"))
+                .and(path(operation.local_path()))
+                .and(body_json(&request.body));
+            if operation == NodeNativeOperation::Messages {
+                mock = mock.and(header("anthropic-version", "2023-06-01"));
+            }
+            mock.respond_with(
+                ResponseTemplate::new(status)
+                    .set_body_json(&body)
+                    .insert_header("set-cookie", "private"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+            let result = OllamaClient::new(server.uri())
+                .native_operation(&request, chrono::Utc::now().timestamp_millis() + 3000)
+                .await
+                .unwrap();
+            assert_eq!(result.body, body);
+            assert_eq!(result.status, status);
+            result.validate_for(operation, model).unwrap();
+            assert!(result.headers.iter().all(|(n, _)| n != "set-cookie"));
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                !requests[0]
+                    .headers
+                    .keys()
+                    .any(|name| name.as_str() == "authorization")
+            );
+            assert!(
+                !requests[0]
+                    .headers
+                    .keys()
+                    .any(|name| name.as_str() == "x-api-key")
+            );
+        }
+    }
+}

@@ -162,7 +162,7 @@ impl TaskExecutor {
             NodeTokenError::TaskExecution("Native request is missing".to_string())
         })?;
         request
-            .validate(&envelope.model)
+            .validate_for(request.operation, &envelope.model)
             .map_err(|e| NodeTokenError::Protocol(e.to_string()))?;
         let requirements = NativeRequirements::from_request(request)
             .map_err(|e| NodeTokenError::UnsupportedCapability(e.to_string()))?;
@@ -184,10 +184,10 @@ impl TaskExecutor {
         }
         let response = self
             .ollama_client
-            .native_chat(request, envelope.deadline_unix_ms)
+            .native_operation(request, envelope.deadline_unix_ms)
             .await?;
         response
-            .validate(&envelope.model)
+            .validate_for(request.operation, &envelope.model)
             .map_err(|e| NodeTokenError::Protocol(e.to_string()))?;
         profile
             .validate_result(&response)
