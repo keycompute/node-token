@@ -20,7 +20,11 @@ Streaming requires an explicit per-model/per-operation `sse` profile. Workers
 keep pulling tasks and upload bounded Start/Data/Terminal events with immutable
 session, lease and sequence identifiers. Event-delivery retries never repeat
 inference; cancellation and malformed terminals stop the local response stream.
-Platform-managed Responses state is a subsequent server feature, not an Ollama
-runtime capability. Known unsupported Ollama features are rejected rather than removed.
+Platform-managed Responses state is implemented by KeyCompute, not by Ollama.
+Non-stream managed tasks require the explicit `cancellation` profile; the worker
+checks its issued lease before and during the single local HTTP request.
+Cancellation, invalid scope or a bounded run of control failures closes that
+request. Session credentials stay fixed for the leased task, and definite
+completion rejections are not retried. Known unsupported Ollama features are rejected rather than removed.
 Cross-repository fixtures under `tests/fixtures` verify compatibility with
 KeyCompute, including operation-specific usage and error response validation.

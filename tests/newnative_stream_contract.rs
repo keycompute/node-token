@@ -207,6 +207,7 @@ fn executor(
         poll_timeout_secs: 1,
     };
     let task = NodeTaskEnvelope {
+        requires_cancellation: false,
         task_id,
         lease_id: NodeLeaseId::new_v4(),
         model: MODEL.into(),

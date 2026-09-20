@@ -50,6 +50,15 @@ pub struct KeyComputeClient {
 }
 
 impl KeyComputeClient {
+    /// Preserve the issued session for one task while sharing the HTTP pool.
+    pub(crate) fn with_fixed_session(&self, token: String) -> Self {
+        Self {
+            base_url: self.base_url.clone(),
+            http_client: self.http_client.clone(),
+            session_token: Arc::new(RwLock::new(Some(token))),
+        }
+    }
+
     /// 创建新的 KeyCompute 客户端
     pub fn new(base_url: impl Into<String>) -> Self {
         let base_url = base_url.into();
@@ -591,5 +600,37 @@ mod stream_delivery_tests {
         assert_eq!(received.len(), 2);
         assert_eq!(received[0].body, received[1].body);
         assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+}
+
+impl KeyComputeClient {
+    /// Query only the metadata of the exact lease held by this worker.
+    pub async fn lease_status(
+        &self,
+        request: &crate::protocol::types::NodeTaskLeaseStatusRequest,
+    ) -> NetworkResult<crate::protocol::types::NodeTaskLeaseStatusResponse> {
+        let url = format!(
+            "{}/node/v1/tasks/{}/lease-status",
+            self.base_url, request.task_id
+        );
+        let response = self
+            .http_client
+            .post(url)
+            .timeout(Duration::from_secs(2))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.require_session_token().await?),
+            )
+            .json(request)
+            .send()
+            .await
+            .map_err(NodeTokenError::Network)?;
+        if !response.status().is_success() {
+            return Err(NodeTokenError::HttpError {
+                status: response.status().as_u16(),
+                message: "Native task lease status is unavailable".into(),
+            });
+        }
+        bounded_json(response, 16 * 1024).await
     }
 }

@@ -135,6 +135,7 @@ async fn completion_retry_reuploads_the_same_result_without_new_inference() {
         }).expect(2).mount(&api).await;
     let now = chrono::Utc::now().timestamp_millis();
     let task = NodeTaskEnvelope {
+        requires_cancellation: false,
         task_id,
         lease_id: Uuid::new_v4(),
         model: "node:literal".into(),

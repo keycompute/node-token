@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::Utc;
 use futures_util::StreamExt;
 use std::time::Duration;
-use tokio_retry::Retry;
+use tokio_retry::RetryIf;
 use tokio_retry::strategy::ExponentialBackoff;
 use tracing::{debug, error, info, warn};
 
@@ -68,6 +68,7 @@ impl TaskExecutor {
         session: SessionData,
         session_lost: Arc<AtomicBool>,
     ) -> Self {
+        let client = Arc::new(client.with_fixed_session(session.session_token.clone()));
         Self {
             client,
             ollama_client,
@@ -125,7 +126,7 @@ impl TaskExecutor {
                 )
                 .await
             } else {
-                self.execute_native(&envelope)
+                self.execute_native_cancellable(&envelope)
                     .await
                     .map(|response| NodeTaskResult::NativeSucceeded { response })
             };
@@ -565,6 +566,94 @@ impl TaskExecutor {
         Ok(())
     }
 
+    async fn execute_native_cancellable(
+        &self,
+        envelope: &NodeTaskEnvelope,
+    ) -> Result<NodeNativeHttpResult> {
+        if !envelope.requires_cancellation {
+            return self.execute_native(envelope).await;
+        }
+        let native = envelope
+            .payload
+            .native
+            .as_ref()
+            .ok_or_else(|| NodeTokenError::Protocol("native request missing".into()))?;
+        native
+            .validate_for(native.operation, &envelope.model)
+            .map_err(|e| NodeTokenError::Protocol(e.into()))?;
+        let needed = NativeRequirements::from_request(native)
+            .map_err(|e| NodeTokenError::UnsupportedCapability(e.into()))?;
+        let capable = self
+            .session
+            .capabilities
+            .native_profiles
+            .iter()
+            .any(|profile| {
+                profile.permits(&needed)
+                    && profile
+                        .features
+                        .contains(&crate::protocol::node_capability::NativeFeature::Cancellation)
+            });
+        if !capable {
+            return Err(NodeTokenError::UnsupportedCapability(
+                "native_cancellation_profile_missing".into(),
+            ));
+        }
+        let request = crate::protocol::types::NodeTaskLeaseStatusRequest {
+            protocol_version: "node.v1".into(),
+            node_id: self.session.node_id,
+            session_id: self.session.session_id,
+            task_id: envelope.task_id,
+            lease_id: envelope.lease_id,
+        };
+        // Verify the issued lease before sending inference. Retain that session's
+        // credential across subsequent checks, even if registration rotates.
+        let initial = self.client.lease_status(&request).await?;
+        if !initial.active {
+            return Err(NodeTokenError::TaskExecution(
+                "native_task_cancelled".into(),
+            ));
+        }
+        let remaining = envelope
+            .deadline_unix_ms
+            .saturating_sub(Utc::now().timestamp_millis());
+        if remaining <= 0 {
+            return Err(NodeTokenError::TaskExecution("native_task_deadline".into()));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(remaining as u64);
+        let execution = self.execute_native(envelope);
+        tokio::pin!(execution);
+        let monitor = async {
+            let mut failures = 0;
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                match self.client.lease_status(&request).await {
+                    Ok(status) if status.active => failures = 0,
+                    Ok(_) => break "native_task_cancelled",
+                    Err(NodeTokenError::HttpError {
+                        status: 401 | 403 | 404 | 409,
+                        ..
+                    }) => break "native_task_lease_invalid",
+                    Err(_) => {
+                        failures += 1;
+                        if failures >= 3 {
+                            break "native_task_control_unavailable";
+                        }
+                    }
+                }
+            }
+        };
+        tokio::pin!(monitor);
+        tokio::select! {
+            biased;
+            result=&mut execution=>result,
+            reason=&mut monitor=>Err(NodeTokenError::TaskExecution(reason.into())),
+            _=tokio::time::sleep_until(deadline)=>Err(NodeTokenError::TaskExecution("native_task_deadline".into())),
+        }
+        // Dropping the single pinned execution closes the local HTTP request.
+        // No control retry creates a new inference attempt.
+    }
+
     async fn execute_native(&self, envelope: &NodeTaskEnvelope) -> Result<NodeNativeHttpResult> {
         let request = envelope.payload.native.as_ref().ok_or_else(|| {
             NodeTokenError::TaskExecution("Native request is missing".to_string())
@@ -828,7 +917,7 @@ impl TaskExecutor {
             task_id, max_retry_duration, max_retries
         );
 
-        match Retry::spawn(retry_strategy, || async {
+        match RetryIf::spawn(retry_strategy, || async {
             match self.client.complete(task_id, &req).await {
                 Ok(resp) => {
                     info!("Task {} completed: action={:?}", task_id, resp.action);
@@ -844,6 +933,9 @@ impl TaskExecutor {
                     Err(e)
                 }
             }
+        }, |error: &NodeTokenError| {
+            matches!(error, NodeTokenError::Network(_))
+                || matches!(error, NodeTokenError::HttpError {status,..} if *status==429 || *status>=500)
         })
         .await
         {
@@ -918,6 +1010,21 @@ fn classify_ollama_error(err: &NodeTokenError) -> NodeTaskResult {
             (format!("ollama_http_{}", status), message.clone(), false)
         }
         NodeTokenError::Network(e) => ("ollama_network".to_string(), e.to_string(), false),
+        NodeTokenError::TaskExecution(code)
+            if matches!(
+                code.as_str(),
+                "native_task_cancelled"
+                    | "native_task_lease_invalid"
+                    | "native_task_control_unavailable"
+                    | "native_task_deadline"
+            ) =>
+        {
+            (
+                code.clone(),
+                "Native execution stopped at its lease or cancellation boundary".into(),
+                true,
+            )
+        }
         other => ("ollama_error".to_string(), other.to_string(), false),
     };
     NodeTaskResult::Failed {

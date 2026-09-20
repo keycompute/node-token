@@ -74,6 +74,7 @@ fn create_chat_request() -> ChatCompletionRequest {
 /// 创建测试用的任务信封
 fn create_task_envelope() -> NodeTaskEnvelope {
     NodeTaskEnvelope {
+        requires_cancellation: false,
         task_id: Uuid::new_v4(),
         lease_id: Uuid::new_v4(),
         model: "deepseek-chat:latest".to_string(),

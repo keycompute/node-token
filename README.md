@@ -252,6 +252,18 @@ If this project helps you, feel free to give it a ⭐️ star.
 **[Quick Start](#quick-start)** • **[Report Issues](https://github.com/keycompute/node-token/issues)** • **[Latest Releases](https://github.com/keycompute/node-token/releases)**
 
 </div>
-# Native Chat protocol (phase 1)
+# Native protocol and managed-task support
 
-The node advertises `node.native.v1` Chat support for the configured Ollama origin at `/v1/chat/completions`. Phase 1 is non-streaming only (`stream: true` is rejected), accepts no caller headers, preserves the complete JSON request and response, and bounds each body to 1 MiB. Only an explicit safe response-header allowlist is returned. Messages, Responses, streaming events, and stateful features require a later server/client upgrade and are not advertised.
+The worker pulls versioned tasks and calls fixed local compatibility endpoints
+for native Chat, Messages and Responses. Complete request/result JSON and safe
+protocol headers are preserved. Per-model declarations control tools, vision,
+thinking, SSE and cancellation; unsupported semantics are rejected, not removed.
+
+Native event uploads carry fixed session, task, lease and sequence identities.
+Managed non-stream tasks check their issued lease during a single local HTTP
+operation and close it on cancellation. KeyCompute owns stored Responses,
+Conversations and background state; Ollama does not need to store these resources.
+
+Deploy the KeyCompute backend before updating node-token and renegotiating
+sessions. Older workers remain eligible only for their declared stateless
+capabilities. See [native protocol details](docs/native-protocols.md).

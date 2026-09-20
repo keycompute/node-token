@@ -408,7 +408,7 @@ impl OllamaClient {
             if !names.contains(&"completion") {
                 return None;
             }
-            let mut features = Vec::new();
+            let mut features = vec![NativeFeature::Cancellation];
             if multi_protocol {
                 features.push(NativeFeature::Sse);
             }
